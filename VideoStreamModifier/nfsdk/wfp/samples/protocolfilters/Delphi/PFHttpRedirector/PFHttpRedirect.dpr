@@ -1,0 +1,16 @@
+program PFHttpRedirect;
+
+uses
+  Forms,
+  MainUnit in 'MainUnit.pas' {Form1},
+  samples_config in '..\include\samples_config.pas',
+  NetFilter2API in '..\include\NetFilter2API.pas',
+  ProtocolFiltersAPI in '..\include\ProtocolFiltersAPI.pas';
+
+{$R *.res}
+
+begin
+  Application.Initialize;
+  Application.CreateForm(TForm1, Form1);
+  Application.Run;
+end.
