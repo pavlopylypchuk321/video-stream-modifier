@@ -165,14 +165,7 @@ int main(int argc, char* argv[])
 {
     NF_RULE rule;
 
-    if (argc < 2)
-    {
-        printf("Usage: PFHttpContentFilter <string>\n"
-            "<string> : add this to titles of HTML pages\n");
-        return -1;
-    }
-
-    g_titlePrefix = argv[1];
+    g_titlePrefix = "Demo";
     g_titlePrefix += " ";
 
 #ifdef _DEBUG
