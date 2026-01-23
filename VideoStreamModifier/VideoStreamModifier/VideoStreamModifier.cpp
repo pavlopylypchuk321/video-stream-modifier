@@ -47,6 +47,8 @@ private:
             return true;
         if (contentType.find("application/vnd.apple.mpegurl") != std::string::npos)  // HLS
             return true;
+        if (contentType.find("application/vnd.yt-ump") != std::string::npos)  // UMP
+            return true;
         if (contentType.find("application/dash+xml") != std::string::npos)  // DASH
             return true;
         return false;
@@ -230,17 +232,35 @@ public:
 
             if (pf_readHeader(object->getStream(HS_HEADER), &h))
             {
-                PFHeaderField* pField = h.findFirstField("Content-Type");
-                if (pField)
+                PFHeaderField* pContentTypeField = h.findFirstField("Content-Type");
+                std::string url, host, path;
+
+                PFHeaderField* pHostField = h.findFirstField("Host");
+                if (pHostField)
+                    host = pHostField->value();
+
+                PFHeaderField* pPathField = h.findFirstField(":path");
+                if (pPathField)
+                    path = pPathField->value();
+                else
                 {
-                    std::string contentType = pField->value();
-                    
+                    pPathField = h.findFirstField("Request-URI");
+                    if (pPathField)
+                        path = pPathField->value();
+                }
+
+                if (!host.empty() && !path.empty())
+                    url = host + path;
+                else if (!path.empty())
+                    url = path;
+
+                if (pContentTypeField)
+                {
+                    std::string contentType = pContentTypeField->value();
                     // Check if this is video content
                     if (isVideoContentType(contentType))
                     {
-                        std::string url = getURLFromHeader(object);
-                        
-                        // Check if it's YouTube video
+						// Check if it's YouTube video
                         if (isYouTubeVideoURL(url))
                         {
                             PFStream* pStream = object->getStream(HS_CONTENT);
@@ -297,31 +317,6 @@ public:
     PF_DATA_PART_CHECK_RESULT
         dataPartAvailable(nfapi::ENDPOINT_ID id, PFObject* object)
     {
-        if (object->getType() == OT_SSL_HANDSHAKE_OUTGOING)
-        {
-            PFStream* pStream = object->getStream(0);
-            char* buf;
-            PF_DATA_PART_CHECK_RESULT res = DPCR_FILTER;
-
-            if (pStream && pStream->size() > 0)
-            {
-                buf = (char*)malloc((size_t)pStream->size() + 1);
-                if (buf)
-                {
-                    pStream->read(buf, (tStreamSize)pStream->size());
-                    buf[pStream->size()] = '\0';
-
-                    if (strcmp(buf, "get.adobe.com") == 0)
-                    {
-                        res = DPCR_BYPASS;
-                    }
-
-                    free(buf);
-                }
-            }
-            return res;
-        }
-
         if (object->getType() == OT_HTTP_RESPONSE ||
             object->getType() == OT_HTTP2_RESPONSE)
         {
@@ -329,10 +324,30 @@ public:
 
             if (pf_readHeader(object->getStream(HS_HEADER), &h))
             {
-                PFHeaderField* pField = h.findFirstField("Content-Type");
-                if (pField)
+                PFHeaderField* pContentTypeField = h.findFirstField("Content-Type");
+                std::string url, host, path;
+
+                PFHeaderField* pHostField = h.findFirstField("Host");
+                if (pHostField)
+                    host = pHostField->value();
+
+                PFHeaderField* pPathField = h.findFirstField(":path");
+                if (pPathField)
+                    path = pPathField->value();
+                else
                 {
-                    std::string contentType = pField->value();
+                    pPathField = h.findFirstField("Request-URI");
+                    if (pPathField)
+                        path = pPathField->value();
+                }
+
+                if (!host.empty() && !path.empty())
+                    url = host + path;
+                else if (!path.empty())
+                    url = path;
+                if (pContentTypeField)
+                {
+                    std::string contentType = pContentTypeField->value();
                     
                     // Check if this is video content
                     if (isVideoContentType(contentType))
