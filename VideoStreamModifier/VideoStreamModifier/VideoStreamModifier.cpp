@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <deque>
 #include <fstream>
 #include <sstream>
 #include <process.h>
@@ -26,20 +27,44 @@ std::string g_titlePrefix;
 std::string g_overlayText = "Custom Overlay";
 std::string g_ffmpegPath = "ffmpeg.exe";  // Path to FFmpeg executable
 
-// Structure to track video stream buffers per connection
+// HTTP/1.1: ENDPOINT_ID -> FIFO of request URLs (best-effort; only reliable without pipelining)
+static std::map<nfapi::ENDPOINT_ID, std::deque<std::string>> g_http1RequestQueue;
+// HTTP/2: ENDPOINT_ID -> (streamId -> request URL)
+static std::map<nfapi::ENDPOINT_ID, std::map<std::string, std::string>> g_http2StreamUrl;
+
+// Structure to track video stream state per connection
 struct VideoStreamBuffer {
-    std::vector<char> data;
     std::string contentType;
     std::string url;
     bool isVideoStream;
+    size_t contentLength;  // Content-Length from header, 0 if chunked
+    size_t processedSize;  // Amount of data already processed
+    bool isProcessing;  // Flag to prevent concurrent processing
     
-    VideoStreamBuffer() : isVideoStream(false) {}
+    VideoStreamBuffer() : isVideoStream(false), contentLength(0), processedSize(0), isProcessing(false) {}
 };
 
 class HttpFilter : public PFEventsDefault
 {
 private:
     std::map<nfapi::ENDPOINT_ID, VideoStreamBuffer> m_videoBuffers;
+
+    static bool readHeader(PFObject* object, int streamIndex, PFHeader& h)
+    {
+        PFStream* s = object->getStream(streamIndex);
+        return s && pf_readHeader(s, &h);
+    }
+
+    static std::string getHttp2StreamId(PFObject* object)
+    {
+        // ProtocolFilters exposes HTTP/2 stream id in the HTTP2 info stream as "x-exhdr-streamid"
+        PFHeader info;
+        if (!readHeader(object, H2S_INFO, info))
+            return "";
+
+        PFHeaderField* f = info.findFirstField("x-exhdr-streamid");
+        return f ? f->value() : "";
+    }
 
     bool isVideoContentType(const std::string& contentType)
     {
@@ -61,34 +86,142 @@ private:
                 url.find("ytimg.com") != std::string::npos);
     }
 
-    std::string getURLFromHeader(PFObject* object)
+    // Overload that accepts already-read header (more efficient)
+    std::string getURLFromHeader(PFObject* object, PFHeader* h)
     {
-        PFHeader h;
-        if (pf_readHeader(object->getStream(HS_HEADER), &h))
+        if (!h)
+            return "";
+
+        std::string host, path, url;
+        tPF_ObjectType objectType = object->getType();
+
+        if (objectType == OT_HTTP_REQUEST)
         {
-            // Try to get host and path
-            std::string host, path;
-            
-            PFHeaderField* pHostField = h.findFirstField("Host");
+            // HTTP request - get host and path from headers
+            PFHeaderField* pHostField = h->findFirstField("Host");
             if (pHostField)
                 host = pHostField->value();
             
-            PFHeaderField* pPathField = h.findFirstField(":path");
-            if (pPathField)
-                path = pPathField->value();
-            else
+            // Get path from status line (first line: "GET /path HTTP/1.1")
+            PFStream* pStatusStream = object->getStream(HS_STATUS);
+            if (pStatusStream && pStatusStream->size() > 0)
             {
-                pPathField = h.findFirstField("Request-URI");
-                if (pPathField)
-                    path = pPathField->value();
+                std::vector<char> statusBuf((size_t)pStatusStream->size() + 1);
+                pStatusStream->seek(0, FILE_BEGIN);
+                pStatusStream->read(statusBuf.data(), (tStreamSize)pStatusStream->size());
+                statusBuf[pStatusStream->size()] = '\0';
+                
+                std::string statusLine(statusBuf.data());
+                // Parse "GET /path HTTP/1.1" format
+                size_t firstSpace = statusLine.find(' ');
+                if (firstSpace != std::string::npos)
+                {
+                    size_t secondSpace = statusLine.find(' ', firstSpace + 1);
+                    if (secondSpace != std::string::npos)
+                    {
+                        path = statusLine.substr(firstSpace + 1, secondSpace - firstSpace - 1);
+                    }
+                }
             }
             
             if (!host.empty() && !path.empty())
-                return host + path;
-            else if (!path.empty())
-                return path;
+            {
+                url = "http://" + host + path;
+            }
         }
-        return "";
+        else if (objectType == OT_HTTP_RESPONSE)
+        {
+            // HTTP response - use custom headers that contain original request info
+            PFHeaderField* pHostField = h->findFirstField("X-EXHDR-REQUEST-HOST");
+            if (pHostField)
+            {
+                host = pHostField->value();
+            }
+            else
+            {
+                // Fallback: try regular Host header
+                pHostField = h->findFirstField("Host");
+                if (pHostField)
+                    host = pHostField->value();
+            }
+            
+            // Get original request line from custom header
+            PFHeaderField* pRequestField = h->findFirstField("X-EXHDR-REQUEST");
+            if (pRequestField)
+            {
+                std::string requestLine = pRequestField->value();
+                
+                // Parse request line: "GET /path HTTP/1.1" or "POST http://full.url/path HTTP/1.1"
+                size_t firstSpace = requestLine.find(' ');
+                if (firstSpace != std::string::npos)
+                {
+                    size_t secondSpace = requestLine.find(' ', firstSpace + 1);
+                    if (secondSpace != std::string::npos)
+                    {
+                        path = requestLine.substr(firstSpace + 1, secondSpace - firstSpace - 1);
+                        
+                        // Check if path already contains a full URL (starts with http:// or https://)
+                        if (path.find("http://") == 0 || path.find("https://") == 0)
+                        {
+                            // Full URL already in path, use it directly
+                            url = path;
+                        }
+                        else
+                        {
+                            // Relative path, construct URL from host + path
+                            if (!host.empty())
+                            {
+                                url = "http://" + host + path;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else if (objectType == OT_HTTP2_REQUEST)
+        {
+            // HTTP/2 request
+            PFHeaderField* pHostField = h->findFirstField(":authority");
+            if (pHostField)
+                host = pHostField->value();
+            
+            PFHeaderField* pPathField = h->findFirstField(":path");
+            if (pPathField)
+                path = pPathField->value();
+            
+            if (!host.empty() && !path.empty())
+            {
+                url = "http://" + host + path;
+            }
+        }
+        else if (objectType == OT_HTTP2_RESPONSE)
+        {
+            // HTTP/2 response - ProtocolFilters exposes original request pseudo-headers as meta fields
+            // (see PFFilterDefs.h): x-exhdr-authority, x-exhdr-path
+            PFHeaderField* pHostField = h->findFirstField("x-exhdr-authority");
+            if (pHostField)
+                host = pHostField->value();
+
+            PFHeaderField* pPathField = h->findFirstField("x-exhdr-path");
+            if (pPathField)
+                path = pPathField->value();
+
+            if (!host.empty() && !path.empty())
+                url = "http://" + host + path;
+        }
+        
+        return url;
+    }
+
+    // Overload that reads header itself (for backward compatibility)
+    std::string getURLFromHeader(PFObject* object)
+    {
+        PFHeader h;
+        if (!pf_readHeader(object->getStream(HS_HEADER), &h))
+        {
+            return "";
+        }
+        return getURLFromHeader(object, &h);
     }
 
     bool processVideoWithFFmpeg(const char* inputData, size_t inputSize, 
@@ -203,10 +336,12 @@ public:
     {
     }
 
-    virtual void tcpDisconnected(nfapi::ENDPOINT_ID id)
+    virtual void tcpClosed(nfapi::ENDPOINT_ID id, nfapi::PNF_TCP_CONN_INFO /*pConnInfo*/)
     {
         // Clean up buffer when connection closes
         m_videoBuffers.erase(id);
+        g_http1RequestQueue.erase(id);
+        g_http2StreamUrl.erase(id);
     }
 
     virtual void tcpConnected(nfapi::ENDPOINT_ID id, nfapi::PNF_TCP_CONN_INFO pConnInfo)
@@ -222,89 +357,137 @@ public:
 
     void dataAvailable(nfapi::ENDPOINT_ID id, PFObject* object)
     {
-        if (object->isReadOnly())
-            return;
+        tPF_ObjectType objType = object->getType();
 
-        if ((object->getType() == OT_HTTP_RESPONSE) ||
-            (object->getType() == OT_HTTP2_RESPONSE))
+        // --- Track requests ---
+        if (objType == OT_HTTP_REQUEST)
         {
             PFHeader h;
+            if (readHeader(object, HS_HEADER, h))
+            {
+                std::string url = getURLFromHeader(object, &h);
+                if (!url.empty())
+                {
+                    g_http1RequestQueue[id].push_back(url);
 
-            if (pf_readHeader(object->getStream(HS_HEADER), &h))
+                    if (isYouTubeVideoURL(url))
+                        printf("[HTTP/1.1] YouTube request: %s\n", url.c_str());
+                }
+            }
+        }
+        else if (objType == OT_HTTP2_REQUEST)
+        {
+            PFHeader h;
+            if (readHeader(object, H2S_HEADER, h))
+            {
+                std::string url = getURLFromHeader(object, &h);
+                std::string sid = getHttp2StreamId(object);
+
+                if (!sid.empty() && !url.empty())
+                {
+                    g_http2StreamUrl[id][sid] = url;
+
+                    if (isYouTubeVideoURL(url))
+                        printf("[HTTP/2] YouTube request (sid=%s): %s\n", sid.c_str(), url.c_str());
+                }
+            }
+        }
+ 
+        // Clean up buffer if this is the final data for a connection
+        if (object->isReadOnly())
+        {
+            // Clean up buffer when connection is done
+            m_videoBuffers.erase(id);
+            g_http1RequestQueue.erase(id);
+            g_http2StreamUrl.erase(id);
+            return;
+        }
+
+        // --- Handle responses (video data is here) ---
+        if (objType == OT_HTTP_RESPONSE || objType == OT_HTTP2_RESPONSE)
+        {
+            PFHeader h;
+            const bool isHttp2 = (objType == OT_HTTP2_RESPONSE);
+            const int headerIndex = isHttp2 ? H2S_HEADER : HS_HEADER;
+            const int contentIndex = isHttp2 ? H2S_CONTENT : HS_CONTENT;
+
+            if (readHeader(object, headerIndex, h))
             {
                 PFHeaderField* pContentTypeField = h.findFirstField("Content-Type");
-                std::string url, host, path;
 
-                PFHeaderField* pHostField = h.findFirstField("Host");
-                if (pHostField)
-                    host = pHostField->value();
+                std::string url = getURLFromHeader(object, &h); // often works due to X-EXHDR-* / x-exhdr-*
 
-                PFHeaderField* pPathField = h.findFirstField(":path");
-                if (pPathField)
-                    path = pPathField->value();
+                // HTTP/2: match by stream id (responses may arrive out of order)
+                if (isHttp2)
+                {
+                    std::string sid = getHttp2StreamId(object);
+                    if (!sid.empty())
+                    {
+                        auto itConn = g_http2StreamUrl.find(id);
+                        if (itConn != g_http2StreamUrl.end())
+                        {
+                            auto itSid = itConn->second.find(sid);
+                            if (itSid != itConn->second.end())
+                            {
+                                url = itSid->second;
+                                itConn->second.erase(itSid);
+                            }
+                        }
+                    }
+                }
                 else
                 {
-                    pPathField = h.findFirstField("Request-URI");
-                    if (pPathField)
-                        path = pPathField->value();
-                }
-
-                if (!host.empty() && !path.empty())
-                    url = host + path;
-                else if (!path.empty())
-                    url = path;
-
-                if (pContentTypeField)
-                {
-                    std::string contentType = pContentTypeField->value();
-                    // Check if this is video content
-                    if (isVideoContentType(contentType))
+                    // HTTP/1.1: responses are typically in-order, so consume FIFO to avoid unbounded growth.
+                    auto it = g_http1RequestQueue.find(id);
+                    if (it != g_http1RequestQueue.end() && !it->second.empty())
                     {
-						// Check if it's YouTube video
-                        if (isYouTubeVideoURL(url))
+                        if (url.empty())
                         {
-                            PFStream* pStream = object->getStream(HS_CONTENT);
-                            if (pStream && pStream->size() > 0)
-                            {
-                                // Read the entire video segment/chunk
-                                size_t chunkSize = (size_t)pStream->size();
-                                
-                                // Only process if we have a reasonable amount of data
-                                // (too small might be metadata or headers)
-                                if (chunkSize > 10240)  // At least 10KB
-                                {
-                                    printf("Processing YouTube video segment: %zu bytes from %s\n", 
-                                           chunkSize, url.c_str());
-                                    
-                                    // Read video data
-                                    std::vector<char> videoData(chunkSize);
-                                    pStream->read(videoData.data(), (tStreamSize)chunkSize);
-                                    
-                                    // Process video with FFmpeg
-                                    std::vector<char> processedData;
-                                    if (processVideoWithFFmpeg(videoData.data(), videoData.size(), processedData))
-                                    {
-                                        // Replace content with processed video
-                                        pStream->reset();
-                                        pStream->write(processedData.data(), (tStreamSize)processedData.size());
-                                        
-                                        printf("Video processed: %zu -> %zu bytes\n", 
-                                               videoData.size(), processedData.size());
-                                    }
-                                    else
-                                    {
-                                        // FFmpeg failed, restore original data
-                                        pStream->reset();
-                                        pStream->write(videoData.data(), (tStreamSize)videoData.size());
-                                        printf("FFmpeg processing failed, using original video\n");
-                                    }
-                                }
-                                else
-                                {
-                                    // Small chunk, likely metadata - pass through
-                                    printf("Skipping small video chunk: %zu bytes\n", chunkSize);
-                                }
-                            }
+                            url = it->second.front();
+                        }
+                        it->second.pop_front();
+                    }
+                }
+                
+                // Check if this is a YouTube video response
+                bool isYouTube = isYouTubeVideoURL(url);
+                bool isVideo = pContentTypeField && isVideoContentType(pContentTypeField->value());
+                
+                if (isYouTube || isVideo)
+                {
+                    PFStream* cs = object->getStream(contentIndex);
+                    printf("[dataAvailable] *** Video Response - URL: %s, Content-Type: %s, Size: %llu\n", 
+                           url.empty() ? "(empty)" : url.c_str(),
+                           pContentTypeField ? pContentTypeField->value().c_str() : "(none)",
+                           cs ? (unsigned long long)cs->size() : 0);
+                }
+                
+                if (pContentTypeField && isYouTube && isVideo)
+                {
+                    // Check if this is video content
+                    PFStream* pStream = object->getStream(contentIndex);
+                    if (pStream && pStream->size() > 0)
+                    {
+                        size_t currentSize = (size_t)pStream->size();
+                        printf("[dataAvailable] Processing YouTube video segment (%s): %zu bytes\n",
+                            isHttp2 ? "HTTP/2" : "HTTP/1.1", currentSize);
+
+                        std::vector<char> videoData(currentSize);
+                        pStream->seek(0, FILE_BEGIN);
+                        pStream->read(videoData.data(), (tStreamSize)currentSize);
+
+                        std::vector<char> processedData;
+                        if (processVideoWithFFmpeg(videoData.data(), videoData.size(), processedData))
+                        {
+                            pStream->reset();
+                            pStream->write(processedData.data(), (tStreamSize)processedData.size());
+
+                            printf("[dataAvailable] Video processed: %zu -> %zu bytes\n",
+                                videoData.size(), processedData.size());
+                        }
+                        else
+                        {
+                            printf("[dataAvailable] FFmpeg processing failed\n");
                         }
                     }
                 }
@@ -312,88 +495,6 @@ public:
         }
 
         pf_postObject(id, object);
-    }
-
-    PF_DATA_PART_CHECK_RESULT
-        dataPartAvailable(nfapi::ENDPOINT_ID id, PFObject* object)
-    {
-        if (object->getType() == OT_HTTP_RESPONSE ||
-            object->getType() == OT_HTTP2_RESPONSE)
-        {
-            PFHeader h;
-
-            if (pf_readHeader(object->getStream(HS_HEADER), &h))
-            {
-                PFHeaderField* pContentTypeField = h.findFirstField("Content-Type");
-                std::string url, host, path;
-
-                PFHeaderField* pHostField = h.findFirstField("Host");
-                if (pHostField)
-                    host = pHostField->value();
-
-                PFHeaderField* pPathField = h.findFirstField(":path");
-                if (pPathField)
-                    path = pPathField->value();
-                else
-                {
-                    pPathField = h.findFirstField("Request-URI");
-                    if (pPathField)
-                        path = pPathField->value();
-                }
-
-                if (!host.empty() && !path.empty())
-                    url = host + path;
-                else if (!path.empty())
-                    url = path;
-                if (pContentTypeField)
-                {
-                    std::string contentType = pContentTypeField->value();
-                    
-                    // Check if this is video content
-                    if (isVideoContentType(contentType))
-                    {
-                        std::string url = getURLFromHeader(object);
-                        
-                        // Check if it's YouTube video
-                        if (isYouTubeVideoURL(url))
-                        {
-                            PFStream* pStream = object->getStream(HS_CONTENT);
-                            if (pStream && pStream->size() > 10240)  // Only process substantial chunks
-                            {
-                                // Read video data
-                                size_t chunkSize = (size_t)pStream->size();
-                                std::vector<char> videoData(chunkSize);
-                                pStream->read(videoData.data(), (tStreamSize)chunkSize);
-                                
-                                // Process video with FFmpeg
-                                std::vector<char> processedData;
-                                if (processVideoWithFFmpeg(videoData.data(), videoData.size(), processedData))
-                                {
-                                    // Replace content with processed video
-                                    pStream->reset();
-                                    pStream->write(processedData.data(), (tStreamSize)processedData.size());
-                                    return DPCR_UPDATE_AND_BYPASS;
-                                }
-                                else
-                                {
-                                    // Restore original and bypass
-                                    pStream->reset();
-                                    pStream->write(videoData.data(), (tStreamSize)videoData.size());
-                                    return DPCR_BYPASS;
-                                }
-                            }
-                            else
-                            {
-                                // Need more data for video processing
-                                return DPCR_MORE_DATA_REQUIRED;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return DPCR_BYPASS;
     }
 };
 
