@@ -227,16 +227,21 @@ private:
     bool processVideoWithFFmpeg(const char* inputData, size_t inputSize, 
                                  std::vector<char>& outputData)
     {
-        // Create temporary input file
-        char tempInputPath[MAX_PATH];
+        char tempInputPath[MAX_PATH] = "";
         char tempOutputPath[MAX_PATH];
-        GetTempPathA(MAX_PATH, tempInputPath);
-        GetTempFileNameA(tempInputPath, "vid", 0, tempInputPath);
-        GetTempFileNameA(tempInputPath, "vid", 0, tempOutputPath);
-        
-        // Change extension
+        GetTempFileNameA("TEMP", "vid", 0, tempInputPath);
+        GetTempFileNameA("TEMP", "vid", 0, tempOutputPath);
+
+        // Remove the ".tmp" extension
         std::string inputFile = tempInputPath;
         std::string outputFile = tempOutputPath;
+
+        size_t dotPos = inputFile.rfind(".tmp");
+        if (dotPos != std::string::npos) inputFile = inputFile.substr(0, dotPos);
+        dotPos = outputFile.rfind(".tmp");
+        if (dotPos != std::string::npos) outputFile = outputFile.substr(0, dotPos);
+
+        // Add the extension you want
         inputFile += ".mp4";
         outputFile += ".mp4";
 
@@ -386,9 +391,6 @@ public:
                 if (!sid.empty() && !url.empty())
                 {
                     g_http2StreamUrl[id][sid] = url;
-
-                    if (isYouTubeVideoURL(url))
-                        printf("[HTTP/2] YouTube request (sid=%s): %s\n", sid.c_str(), url.c_str());
                 }
             }
         }
@@ -469,8 +471,6 @@ public:
                     if (pStream && pStream->size() > 0)
                     {
                         size_t currentSize = (size_t)pStream->size();
-                        printf("[dataAvailable] Processing YouTube video segment (%s): %zu bytes\n",
-                            isHttp2 ? "HTTP/2" : "HTTP/1.1", currentSize);
 
                         std::vector<char> videoData(currentSize);
                         pStream->seek(0, FILE_BEGIN);
@@ -481,7 +481,6 @@ public:
                         {
                             pStream->reset();
                             pStream->write(processedData.data(), (tStreamSize)processedData.size());
-
                             printf("[dataAvailable] Video processed: %zu -> %zu bytes\n",
                                 videoData.size(), processedData.size());
                         }
