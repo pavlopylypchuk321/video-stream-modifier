@@ -20,6 +20,8 @@ bld/
 [Ll]og/
 [Ll]ogs/
 
+VideoStreamModifier/VideoStreamModifier/Temp/
+
 ## Visual Studio cache/options directory
 .vs/
 .vscode/
