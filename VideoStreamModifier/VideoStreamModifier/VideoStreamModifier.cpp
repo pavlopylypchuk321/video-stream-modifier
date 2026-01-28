@@ -660,9 +660,6 @@ public:
                 if (!url.empty())
                 {
                     g_http1RequestQueue[id].push_back(url);
-
-                    if (isYouTubeVideoURL(url))
-                        printf("[HTTP/1.1] YouTube request: %s\n", url.c_str());
                 }
             }
         }
@@ -740,15 +737,6 @@ public:
                 // Check if this is a YouTube video response
                 bool isYouTube = isYouTubeVideoURL(url);
                 bool isVideo = pContentTypeField && isVideoContentType(pContentTypeField->value());
-                
-                if (isYouTube || isVideo)
-                {
-                    PFStream* cs = object->getStream(contentIndex);
-                    printf("[dataAvailable] *** Video Response - URL: %s, Content-Type: %s, Size: %llu\n", 
-                           url.empty() ? "(empty)" : url.c_str(),
-                           pContentTypeField ? pContentTypeField->value().c_str() : "(none)",
-                           cs ? (unsigned long long)cs->size() : 0);
-                }
                 
                 if (pContentTypeField && isYouTube && isVideo)
                 {
