@@ -97,6 +97,12 @@ private:
         std::unordered_map<uint8_t, std::vector<uint8_t>> curByHeaderId;
         std::unordered_map<uint8_t, std::vector<std::vector<uint8_t>>> pendingByHeaderId;
         std::unordered_map<uint8_t, uint64_t> segIndexByHeaderId;
+
+        // Rewritten UMP bytes (we re-emit parts after processing instead of
+        // forwarding the original bytes directly).
+        std::vector<uint8_t> rewrittenUmpOut;
+        // Number of bytes already sent downstream from rewrittenUmpOut.
+        size_t rewrittenSentOffset = 0;
     };
 
     // Keyed by endpoint + (http2 stream id if present) + url (best-effort uniqueness)
@@ -361,6 +367,50 @@ private:
         default:
             return false;
         }
+    }
+
+    // --- Minimal UMP writer (local; mirrors googlevideo-c/googlevideo/core/UmpWriter.cpp) ---
+    static void umpWriteVarInt(std::vector<uint8_t>& out, uint32_t value)
+    {
+        if (value < 128)
+        {
+            out.push_back(static_cast<uint8_t>(value));
+        }
+        else if (value < 16384)
+        {
+            out.push_back(static_cast<uint8_t>((value & 0x3F) | 0x80));
+            out.push_back(static_cast<uint8_t>(value >> 6));
+        }
+        else if (value < 2097152)
+        {
+            out.push_back(static_cast<uint8_t>((value & 0x1F) | 0xC0));
+            out.push_back(static_cast<uint8_t>((value >> 5) & 0xFF));
+            out.push_back(static_cast<uint8_t>(value >> 13));
+        }
+        else if (value < 268435456)
+        {
+            out.push_back(static_cast<uint8_t>((value & 0x0F) | 0xE0));
+            out.push_back(static_cast<uint8_t>((value >> 4) & 0xFF));
+            out.push_back(static_cast<uint8_t>((value >> 12) & 0xFF));
+            out.push_back(static_cast<uint8_t>(value >> 20));
+        }
+        else
+        {
+            out.push_back(0xF0);
+            uint32_t v = value;
+            out.push_back(static_cast<uint8_t>(v & 0xFF));
+            out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+            out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+            out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+        }
+    }
+
+    static void umpWritePart(std::vector<uint8_t>& out, int partType, const std::vector<uint8_t>& partData)
+    {
+        const uint32_t partSize = static_cast<uint32_t>(partData.size());
+        umpWriteVarInt(out, static_cast<uint32_t>(partType));
+        umpWriteVarInt(out, partSize);
+        out.insert(out.end(), partData.begin(), partData.end());
     }
 
     // Minimal protobuf decode for video_streaming.MediaHeader (we only need a few varint fields):
@@ -1058,6 +1108,10 @@ private:
                     cur.hasItag ? std::to_string(cur.itag).c_str() : "?",
                     cur.hasIsInitSeg ? (cur.isInitSeg ? "true" : "false") : "?",
                     cur.hasSeq ? std::to_string(cur.sequenceNumber).c_str() : "?");
+
+                // Re-emit the MEDIA_HEADER part into the rewritten UMP stream unchanged.
+                const std::vector<uint8_t> headerBytes = compositeToVector(part.data);
+                umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerBytes);
             }
             return;
         }
@@ -1168,16 +1222,33 @@ private:
             mp4.insert(mp4.end(), segment.begin(), segment.end());
 
             std::vector<uint8_t> processedMp4;
-            if (processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText))
+            bool processedOk = processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText);
+            if (processedOk)
             {
                 printf("[UMP] Processed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
                     (unsigned)headerId, mp4.size(), processedMp4.size());
-                // TODO: repackage processedMp4 back into UMP MEDIA parts to feed modified video to the player.
             }
             else
             {
-                printf("[UMP] FFmpeg library processing failed for headerId=%u\n", (unsigned)headerId);
+                printf("[UMP] FFmpeg library processing failed for headerId=%u, falling back to original bytes\n",
+                    (unsigned)headerId);
+                processedMp4 = std::move(mp4);
             }
+
+            // Repackage the (possibly processed) MP4 back into UMP MEDIA + MEDIA_END
+            // parts so it can be delivered back to the browser. For simplicity we
+            // emit a single MEDIA part containing the full fragment, followed by a
+            // MEDIA_END containing only the headerId, which matches the example
+            // shape in googlevideo-c/tests/ump_example_test.cpp.
+            std::vector<uint8_t> mediaData;
+            mediaData.reserve(1 + processedMp4.size());
+            mediaData.push_back(headerId);
+            mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
+            umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+
+            std::vector<uint8_t> mediaEndData(1);
+            mediaEndData[0] = headerId;
+            umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaEndData);
         }
     }
 
@@ -1350,10 +1421,30 @@ public:
                                 pStream->read(reinterpret_cast<char*>(newBytes.data()), (tStreamSize)delta);
                                 processed = currentSize;
 
-                                UmpAssembler& assem = m_ump[k];
-                                assem.buffer.append(newBytes);
+                        UmpAssembler& assem = m_ump[k];
+                        assem.buffer.append(newBytes);
 
-                                consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part); });
+                        // Before consuming parts, remember how many rewritten bytes we have already
+                        // emitted so we can compute the delta for this chunk.
+                        const size_t prevRewrittenSize = assem.rewrittenUmpOut.size();
+
+                        consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part); });
+
+                        // After processing, any new bytes appended to rewrittenUmpOut correspond
+                        // to this chunk of input. Replace the HTTP body with those bytes so the
+                        // browser sees the modified UMP stream instead of the original one.
+                        if (assem.rewrittenUmpOut.size() > prevRewrittenSize)
+                        {
+                            size_t available = assem.rewrittenUmpOut.size() - assem.rewrittenSentOffset;
+                            if (available > 0)
+                            {
+                                pStream->reset();
+                                pStream->write(
+                                    reinterpret_cast<const char*>(assem.rewrittenUmpOut.data() + assem.rewrittenSentOffset),
+                                    (tStreamSize)available);
+                                assem.rewrittenSentOffset = assem.rewrittenUmpOut.size();
+                            }
+                        }
                             }
                         }
                         else
