@@ -11,6 +11,10 @@
 #include <deque>
 #include <fstream>
 #include <sstream>
+#include <unordered_map>
+#include <algorithm>
+#include <functional>
+#include <cctype>
 #include <process.h>
 
 #include "ProtocolFilters.h"
@@ -18,10 +22,13 @@
 
 #include "samples_config.h"
 
+#include "CompositeBuffer.h"
+
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace nfapi;
 using namespace ProtocolFilters;
+using GoogleVideoMin::CompositeBuffer;
 
 std::string g_titlePrefix;
 std::string g_overlayText = "Custom Overlay";
@@ -48,6 +55,25 @@ class HttpFilter : public PFEventsDefault
 {
 private:
     std::map<nfapi::ENDPOINT_ID, VideoStreamBuffer> m_videoBuffers;
+
+    struct UmpPart
+    {
+        int type;
+        int size;
+        CompositeBuffer data;
+    };
+
+    struct UmpAssembler
+    {
+        CompositeBuffer buffer;
+        std::unordered_map<uint8_t, std::vector<uint8_t>> initByHeaderId;
+        std::unordered_map<uint8_t, std::vector<uint8_t>> curByHeaderId;
+        std::unordered_map<uint8_t, uint64_t> segIndexByHeaderId;
+    };
+
+    // Keyed by endpoint + (http2 stream id if present) + url (best-effort uniqueness)
+    std::map<std::string, UmpAssembler> m_ump;
+    std::map<std::string, size_t> m_umpProcessedSize;
 
     static bool readHeader(PFObject* object, int streamIndex, PFHeader& h)
     {
@@ -224,6 +250,255 @@ private:
         return getURLFromHeader(object, &h);
     }
 
+    static std::string sanitizeFilename(std::string s)
+    {
+        for (char &c : s)
+        {
+            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.'))
+                c = '_';
+        }
+        if (s.size() > 120) s.resize(120);
+        return s;
+    }
+
+    static bool startsWithBoxType(const std::vector<uint8_t>& bytes, const char* type4)
+    {
+        // MP4 box: [0..3]=size, [4..7]=type
+        if (bytes.size() < 8) return false;
+        return bytes[4] == static_cast<uint8_t>(type4[0]) &&
+               bytes[5] == static_cast<uint8_t>(type4[1]) &&
+               bytes[6] == static_cast<uint8_t>(type4[2]) &&
+               bytes[7] == static_cast<uint8_t>(type4[3]);
+    }
+
+    static bool looksLikeInitSegment(const std::vector<uint8_t>& bytes)
+    {
+        // Common init segment starts with ftyp then moov, but we just check leading ftyp/styp.
+        return startsWithBoxType(bytes, "ftyp") || startsWithBoxType(bytes, "styp");
+    }
+
+    static void appendCompositeToVector(const CompositeBuffer& b, std::vector<uint8_t>& out)
+    {
+        for (const auto& ch : b.chunks)
+            out.insert(out.end(), ch.begin(), ch.end());
+    }
+
+    static bool runFFmpegExtractFirstFramePPM(const std::string& inputMp4, const std::string& outPpm)
+    {
+        std::ostringstream cmd;
+        cmd << g_ffmpegPath
+            << " -hide_banner -loglevel error"
+            << " -i \"" << inputMp4 << "\""
+            << " -frames:v 1 -f image2 -vcodec ppm"
+            << " -y \"" << outPpm << "\"";
+
+        STARTUPINFOA si = { sizeof(si) };
+        PROCESS_INFORMATION pi{};
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+        std::string cmdStr = cmd.str();
+        std::vector<char> cmdLine(cmdStr.begin(), cmdStr.end());
+        cmdLine.push_back('\0');
+
+        BOOL success = CreateProcessA(
+            NULL,
+            cmdLine.data(),
+            NULL,
+            NULL,
+            TRUE,
+            CREATE_NO_WINDOW,
+            NULL,
+            NULL,
+            &si,
+            &pi
+        );
+
+        if (!success)
+            return false;
+
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, 30000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        return (waitResult == WAIT_OBJECT_0);
+    }
+
+    static std::pair<int, int> readVarInt(const CompositeBuffer& buffer, int offset)
+    {
+        int byteLength;
+
+        if (buffer.canReadBytes(offset, 1))
+        {
+            uint8_t firstByte = buffer.getUint8(offset);
+            if (firstByte < 128)
+                byteLength = 1;
+            else if (firstByte < 192)
+                byteLength = 2;
+            else if (firstByte < 224)
+                byteLength = 3;
+            else if (firstByte < 240)
+                byteLength = 4;
+            else
+                byteLength = 5;
+        }
+        else
+        {
+            byteLength = 0;
+        }
+
+        if (byteLength < 1 || !buffer.canReadBytes(offset, static_cast<size_t>(byteLength)))
+            return { -1, offset };
+
+        int value = 0;
+        switch (byteLength)
+        {
+        case 1:
+            value = buffer.getUint8(offset++);
+            break;
+        case 2:
+        {
+            int byte1 = buffer.getUint8(offset++);
+            int byte2 = buffer.getUint8(offset++);
+            value = (byte1 & 0x3f) + 64 * byte2;
+            break;
+        }
+        case 3:
+        {
+            int byte1 = buffer.getUint8(offset++);
+            int byte2 = buffer.getUint8(offset++);
+            int byte3 = buffer.getUint8(offset++);
+            value = (byte1 & 0x1f) + 32 * (byte2 + 256 * byte3);
+            break;
+        }
+        case 4:
+        {
+            int byte1 = buffer.getUint8(offset++);
+            int byte2 = buffer.getUint8(offset++);
+            int byte3 = buffer.getUint8(offset++);
+            int byte4 = buffer.getUint8(offset++);
+            value = (byte1 & 0x0f) + 16 * (byte2 + 256 * (byte3 + 256 * byte4));
+            break;
+        }
+        default:
+        {
+            // 5-byte encoding: 0xF0 then 4 bytes little-endian
+            int tempOffset = offset + 1;
+            buffer.focus(tempOffset);
+            int b0 = buffer.getUint8(tempOffset);
+            int b1 = buffer.getUint8(tempOffset + 1);
+            int b2 = buffer.getUint8(tempOffset + 2);
+            int b3 = buffer.getUint8(tempOffset + 3);
+            value = b0 + 256 * (b1 + 256 * (b2 + 256 * b3));
+            offset += 5;
+            break;
+        }
+        }
+
+        return { value, offset };
+    }
+
+    void consumeUmpParts(UmpAssembler& assem, const std::function<void(const UmpPart&)>& onPart)
+    {
+        while (true)
+        {
+            int offset = 0;
+            auto [partType, newOffset] = readVarInt(assem.buffer, offset);
+            offset = newOffset;
+
+            if (partType < 0)
+                break;
+
+            auto [partSize, finalOffset] = readVarInt(assem.buffer, offset);
+            offset = finalOffset;
+
+            if (partSize < 0)
+                break;
+
+            if (!assem.buffer.canReadBytes(offset, static_cast<size_t>(partSize)))
+                break;
+
+            auto split1 = assem.buffer.split(static_cast<size_t>(offset)); // skip header
+            auto split2 = split1.second.split(static_cast<size_t>(partSize));
+
+            UmpPart p{ partType, partSize, split2.first };
+            onPart(p);
+
+            assem.buffer = split2.second;
+        }
+    }
+
+    void handleUmpPart(UmpAssembler& assem, const UmpPart& part)
+    {
+        // Part IDs (from YouTube UMP): MEDIA=21, MEDIA_END=22
+        const int UMP_PART_ID_MEDIA = 21;
+        const int UMP_PART_ID_MEDIA_END = 22;
+
+        if (part.type == UMP_PART_ID_MEDIA)
+        {
+            uint8_t headerId = part.data.getUint8(0);
+            auto split = part.data.split(1);
+            auto& cur = assem.curByHeaderId[headerId];
+            appendCompositeToVector(split.second, cur);
+        }
+        else if (part.type == UMP_PART_ID_MEDIA_END)
+        {
+            uint8_t headerId = part.data.getUint8(0);
+            auto it = assem.curByHeaderId.find(headerId);
+            if (it == assem.curByHeaderId.end())
+                return;
+
+            std::vector<uint8_t> segment = std::move(it->second);
+            assem.curByHeaderId.erase(it);
+
+            if (segment.empty())
+                return;
+
+            if (looksLikeInitSegment(segment))
+            {
+                assem.initByHeaderId[headerId] = std::move(segment);
+                printf("[UMP] Stored init segment for headerId=%u (%zu bytes)\n",
+                    (unsigned)headerId, assem.initByHeaderId[headerId].size());
+                return;
+            }
+
+            auto itInit = assem.initByHeaderId.find(headerId);
+            if (itInit == assem.initByHeaderId.end() || itInit->second.empty())
+            {
+                printf("[UMP] No init segment yet for headerId=%u, skipping media fragment (%zu bytes)\n",
+                    (unsigned)headerId, segment.size());
+                return;
+            }
+
+            // Combine init + fragment (best-effort)
+            std::vector<uint8_t> mp4;
+            mp4.reserve(itInit->second.size() + segment.size());
+            mp4.insert(mp4.end(), itInit->second.begin(), itInit->second.end());
+            mp4.insert(mp4.end(), segment.begin(), segment.end());
+
+            // Write to mp4 and extract first frame to PPM using ffmpeg.exe
+            CreateDirectoryA("ump_output", NULL);
+            uint64_t idx = assem.segIndexByHeaderId[headerId]++;
+            std::ostringstream mp4Path, ppmPath;
+            mp4Path << "ump_output\\h" << (unsigned)headerId << "_seg" << idx << ".mp4";
+            ppmPath << "ump_output\\h" << (unsigned)headerId << "_seg" << idx << "_frame0.ppm";
+
+            std::ofstream out(mp4Path.str(), std::ios::binary);
+            out.write(reinterpret_cast<const char*>(mp4.data()), (std::streamsize)mp4.size());
+            out.close();
+
+            if (runFFmpegExtractFirstFramePPM(mp4Path.str(), ppmPath.str()))
+            {
+                printf("[UMP] Extracted first frame: %s\n", ppmPath.str().c_str());
+            }
+            else
+            {
+                printf("[UMP] FFmpeg frame extract failed for: %s\n", mp4Path.str().c_str());
+            }
+        }
+    }
+
     bool processVideoWithFFmpeg(const char* inputData, size_t inputSize, 
                                  std::vector<char>& outputData)
     {
@@ -242,7 +517,7 @@ private:
         if (dotPos != std::string::npos) outputFile = outputFile.substr(0, dotPos);
 
         // Add the extension you want
-        inputFile += ".mp4";
+        inputFile += ".bin";
         outputFile += ".mp4";
 
         // Write input data to temp file
@@ -339,6 +614,17 @@ private:
 public:
     HttpFilter()
     {
+    }
+
+    // Offline / unit-test helper: feed raw UMP bytes and run the same extraction logic as live traffic.
+    void debugProcessUmpBytes(const std::vector<uint8_t>& bytes, const std::string& key)
+    {
+        size_t& processed = m_umpProcessedSize[key];
+        processed += bytes.size();
+
+        UmpAssembler& assem = m_ump[key];
+        assem.buffer.append(bytes);
+        consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part); });
     }
 
     virtual void tcpClosed(nfapi::ENDPOINT_ID id, nfapi::PNF_TCP_CONN_INFO /*pConnInfo*/)
@@ -470,23 +756,53 @@ public:
                     PFStream* pStream = object->getStream(contentIndex);
                     if (pStream && pStream->size() > 0)
                     {
-                        size_t currentSize = (size_t)pStream->size();
+                        std::string contentType = pContentTypeField->value();
 
-                        std::vector<char> videoData(currentSize);
-                        pStream->seek(0, FILE_BEGIN);
-                        pStream->read(videoData.data(), (tStreamSize)currentSize);
-
-                        std::vector<char> processedData;
-                        if (processVideoWithFFmpeg(videoData.data(), videoData.size(), processedData))
+                        // --- UMP path: parse UMP and dump first decoded frame per completed segment ---
+                        if (contentType.find("application/vnd.yt-ump") != std::string::npos)
                         {
-                            pStream->reset();
-                            pStream->write(processedData.data(), (tStreamSize)processedData.size());
-                            printf("[dataAvailable] Video processed: %zu -> %zu bytes\n",
-                                videoData.size(), processedData.size());
+                            std::string sid = isHttp2 ? getHttp2StreamId(object) : "";
+                            std::ostringstream key;
+                            key << id << ":" << (sid.empty() ? "h1" : sid) << ":" << sanitizeFilename(url);
+                            std::string k = key.str();
+
+                            size_t& processed = m_umpProcessedSize[k];
+                            size_t currentSize = (size_t)pStream->size();
+                            if (currentSize > processed)
+                            {
+                                size_t delta = currentSize - processed;
+                                std::vector<uint8_t> newBytes(delta);
+                                pStream->seek((tStreamPos)processed, FILE_BEGIN);
+                                pStream->read(reinterpret_cast<char*>(newBytes.data()), (tStreamSize)delta);
+                                processed = currentSize;
+
+                                UmpAssembler& assem = m_ump[k];
+                                assem.buffer.append(newBytes);
+
+                                consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part); });
+                            }
                         }
                         else
                         {
-                            printf("[dataAvailable] FFmpeg processing failed\n");
+                            // --- Non-UMP path: apply overlay by remuxing with ffmpeg ---
+                            size_t currentSize = (size_t)pStream->size();
+
+                            std::vector<char> videoData(currentSize);
+                            pStream->seek(0, FILE_BEGIN);
+                            pStream->read(videoData.data(), (tStreamSize)currentSize);
+
+                            std::vector<char> processedData;
+                            if (processVideoWithFFmpeg(videoData.data(), videoData.size(), processedData))
+                            {
+                                pStream->reset();
+                                pStream->write(processedData.data(), (tStreamSize)processedData.size());
+                                printf("[dataAvailable] Video processed: %zu -> %zu bytes\n",
+                                    videoData.size(), processedData.size());
+                            }
+                            else
+                            {
+                                printf("[dataAvailable] FFmpeg processing failed\n");
+                            }
                         }
                     }
                 }
@@ -513,6 +829,32 @@ int main(int argc, char* argv[])
     printf("Video Overlay Text: %s\n", g_overlayText.c_str());
     printf("FFmpeg Path: %s\n", g_ffmpegPath.c_str());
     printf("Starting video stream modifier...\n");
+
+    // Offline debug mode: parse a dumped UMP file and extract frames into ./ump_output
+    // Usage: VideoStreamModifier.exe --parse-ump path\to\dump.bin
+    if (argc >= 3 && std::string(argv[1]) == "--parse-ump")
+    {
+        const char* path = argv[2];
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f.is_open())
+        {
+            printf("Failed to open UMP dump: %s\n", path);
+            return 2;
+        }
+        std::streamsize sz = f.tellg();
+        f.seekg(0, std::ios::beg);
+        std::vector<uint8_t> data((size_t)sz);
+        if (!f.read(reinterpret_cast<char*>(data.data()), sz))
+        {
+            printf("Failed to read UMP dump: %s\n", path);
+            return 3;
+        }
+
+        HttpFilter offline;
+        offline.debugProcessUmpBytes(data, "offline");
+        printf("Done. Check .\\ump_output\\ for extracted segments/frames.\n");
+        return 0;
+    }
 
 #ifdef _DEBUG
     _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF | _CRTDBG_CHECK_CRT_DF);
