@@ -24,6 +24,21 @@
 
 #include "CompositeBuffer.h"
 
+// FFmpeg library headers (we use the libraries directly instead of the CLI)
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
+}
+
+// Link against FFmpeg import libraries (Visual Studio)
+#pragma comment(lib, "avformat.lib")
+#pragma comment(lib, "avcodec.lib")
+#pragma comment(lib, "avutil.lib")
+#pragma comment(lib, "swscale.lib")
+
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace nfapi;
@@ -56,6 +71,16 @@ class HttpFilter : public PFEventsDefault
 private:
     std::map<nfapi::ENDPOINT_ID, VideoStreamBuffer> m_videoBuffers;
 
+    struct MediaHeaderMeta
+    {
+        bool hasIsInitSeg = false;
+        bool isInitSeg = false;
+        bool hasItag = false;
+        int32_t itag = 0;
+        bool hasSeq = false;
+        int32_t sequenceNumber = 0;
+    };
+
     struct UmpPart
     {
         int type;
@@ -66,8 +91,11 @@ private:
     struct UmpAssembler
     {
         CompositeBuffer buffer;
+        std::unordered_map<uint8_t, MediaHeaderMeta> metaByHeaderId;
         std::unordered_map<uint8_t, std::vector<uint8_t>> initByHeaderId;
+        std::unordered_map<int32_t, std::vector<uint8_t>> initByItag;
         std::unordered_map<uint8_t, std::vector<uint8_t>> curByHeaderId;
+        std::unordered_map<uint8_t, std::vector<std::vector<uint8_t>>> pendingByHeaderId;
         std::unordered_map<uint8_t, uint64_t> segIndexByHeaderId;
     };
 
@@ -273,8 +301,9 @@ private:
 
     static bool looksLikeInitSegment(const std::vector<uint8_t>& bytes)
     {
-        // Common init segment starts with ftyp then moov, but we just check leading ftyp/styp.
-        return startsWithBoxType(bytes, "ftyp") || startsWithBoxType(bytes, "styp");
+        // Common init segment starts with ftyp then moov, but YouTube init segments sometimes
+        // begin with other boxes. We keep this as a heuristic fallback only.
+        return startsWithBoxType(bytes, "ftyp") || startsWithBoxType(bytes, "styp") || startsWithBoxType(bytes, "moov");
     }
 
     static void appendCompositeToVector(const CompositeBuffer& b, std::vector<uint8_t>& out)
@@ -283,6 +312,115 @@ private:
             out.insert(out.end(), ch.begin(), ch.end());
     }
 
+    static std::vector<uint8_t> compositeToVector(const CompositeBuffer& b)
+    {
+        std::vector<uint8_t> out;
+        out.reserve(b.getLength());
+        appendCompositeToVector(b, out);
+        return out;
+    }
+
+    static bool pbReadVarint(const std::vector<uint8_t>& bytes, size_t& i, uint64_t& out)
+    {
+        out = 0;
+        int shift = 0;
+        while (i < bytes.size() && shift <= 63)
+        {
+            uint8_t c = bytes[i++];
+            out |= (uint64_t)(c & 0x7F) << shift;
+            if ((c & 0x80) == 0)
+                return true;
+            shift += 7;
+        }
+        return false;
+    }
+
+    static bool pbSkipField(const std::vector<uint8_t>& bytes, size_t& i, uint32_t wireType)
+    {
+        switch (wireType)
+        {
+        case 0: { // varint
+            uint64_t tmp;
+            return pbReadVarint(bytes, i, tmp);
+        }
+        case 1: // 64-bit
+            if (i + 8 > bytes.size()) return false;
+            i += 8;
+            return true;
+        case 2: { // length-delimited
+            uint64_t len;
+            if (!pbReadVarint(bytes, i, len)) return false;
+            if (i + (size_t)len > bytes.size()) return false;
+            i += (size_t)len;
+            return true;
+        }
+        case 5: // 32-bit
+            if (i + 4 > bytes.size()) return false;
+            i += 4;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // Minimal protobuf decode for video_streaming.MediaHeader (we only need a few varint fields):
+    // header_id (1), itag (3), is_init_seg (8), sequence_number (9)
+    static bool parseMediaHeaderMeta(const CompositeBuffer& buf, uint8_t& headerIdOut, MediaHeaderMeta& metaOut)
+    {
+        const std::vector<uint8_t> bytes = compositeToVector(buf);
+        size_t i = 0;
+        bool hasHeader = false;
+        uint32_t headerId32 = 0;
+
+        while (i < bytes.size())
+        {
+            uint64_t tag;
+            if (!pbReadVarint(bytes, i, tag)) break;
+            const uint32_t field = (uint32_t)(tag >> 3);
+            const uint32_t wt = (uint32_t)(tag & 0x07);
+
+            if (field == 1 && wt == 0)
+            {
+                uint64_t v;
+                if (!pbReadVarint(bytes, i, v)) return false;
+                headerId32 = (uint32_t)v;
+                hasHeader = true;
+            }
+            else if (field == 3 && wt == 0)
+            {
+                uint64_t v;
+                if (!pbReadVarint(bytes, i, v)) return false;
+                metaOut.hasItag = true;
+                metaOut.itag = (int32_t)v;
+            }
+            else if (field == 8 && wt == 0)
+            {
+                uint64_t v;
+                if (!pbReadVarint(bytes, i, v)) return false;
+                metaOut.hasIsInitSeg = true;
+                metaOut.isInitSeg = (v != 0);
+            }
+            else if (field == 9 && wt == 0)
+            {
+                uint64_t v;
+                if (!pbReadVarint(bytes, i, v)) return false;
+                metaOut.hasSeq = true;
+                metaOut.sequenceNumber = (int32_t)v;
+            }
+            else
+            {
+                if (!pbSkipField(bytes, i, wt)) break;
+            }
+        }
+
+        if (!hasHeader || headerId32 > 255)
+            return false;
+
+        headerIdOut = (uint8_t)headerId32;
+        return true;
+    }
+
+    // Helper used only for UMP debugging: call ffmpeg.exe to extract the first frame as a PPM image.
     static bool runFFmpegExtractFirstFramePPM(const std::string& inputMp4, const std::string& outPpm)
     {
         std::ostringstream cmd;
@@ -323,6 +461,473 @@ private:
         CloseHandle(pi.hThread);
 
         return (waitResult == WAIT_OBJECT_0);
+    }
+
+    // Simple in-place overlay: draw a white box in the top-left corner of an RGB24 frame.
+    static void drawSimpleOverlayRGB24(AVFrame* f)
+    {
+        if (!f || f->format != AV_PIX_FMT_RGB24 || !f->data[0])
+            return;
+
+        const int boxW = min(200, f->width);
+        const int boxH = min(40, f->height);
+        for (int y = 0; y < boxH; ++y)
+        {
+            uint8_t* row = f->data[0] + y * f->linesize[0];
+            for (int x = 0; x < boxW; ++x)
+            {
+                row[x * 3 + 0] = 255; // B
+                row[x * 3 + 1] = 255; // G
+                row[x * 3 + 2] = 255; // R
+            }
+        }
+    }
+
+    struct MemBuffer
+    {
+        const uint8_t* data;
+        size_t size;
+        size_t pos;
+    };
+
+    static int readPacket(void* opaque, uint8_t* buf, int buf_size)
+    {
+        MemBuffer* mb = static_cast<MemBuffer*>(opaque);
+        if (!mb || !mb->data)
+            return AVERROR_EOF;
+        size_t remaining = mb->size - mb->pos;
+        int toCopy = static_cast<int>(min(remaining, static_cast<size_t>(buf_size)));
+        if (toCopy <= 0)
+            return AVERROR_EOF;
+        memcpy(buf, mb->data + mb->pos, static_cast<size_t>(toCopy));
+        mb->pos += static_cast<size_t>(toCopy);
+        return toCopy;
+    }
+
+    struct OutBuffer
+    {
+        std::vector<uint8_t>* vec;
+        int64_t pos;
+    };
+
+    // Write callback for custom AVIO that writes into a seekable in-memory vector.
+    static int writePacket(void* opaque, const uint8_t* buf, int buf_size)
+    {
+        OutBuffer* ob = static_cast<OutBuffer*>(opaque);
+        if (!ob || !ob->vec || !buf || buf_size <= 0)
+            return AVERROR(EINVAL);
+
+        std::vector<uint8_t>& v = *ob->vec;
+        int64_t endPos = ob->pos + buf_size;
+        if (endPos > static_cast<int64_t>(v.size()))
+            v.resize(static_cast<size_t>(endPos));
+
+        memcpy(v.data() + ob->pos, buf, static_cast<size_t>(buf_size));
+        ob->pos = endPos;
+        return buf_size;
+    }
+
+    // Seek callback to make the output AVIOContext seekable for the MP4 muxer.
+    static int64_t seekPacket(void* opaque, int64_t offset, int whence)
+    {
+        OutBuffer* ob = static_cast<OutBuffer*>(opaque);
+        if (!ob || !ob->vec)
+            return AVERROR(EINVAL);
+
+        std::vector<uint8_t>& v = *ob->vec;
+
+        if (whence & AVSEEK_SIZE)
+        {
+            // Query for current buffer size.
+            return static_cast<int64_t>(v.size());
+        }
+
+        int64_t newPos = 0;
+        switch (whence)
+        {
+        case SEEK_SET:
+            newPos = offset;
+            break;
+        case SEEK_CUR:
+            newPos = ob->pos + offset;
+            break;
+        case SEEK_END:
+            newPos = static_cast<int64_t>(v.size()) + offset;
+            break;
+        default:
+            return AVERROR(EINVAL);
+        }
+
+        if (newPos < 0)
+            return AVERROR(EINVAL);
+
+        // Allow seeking past current end; buffer will grow on next write.
+        ob->pos = newPos;
+        return newPos;
+    }
+
+    // Decode an MP4 segment with FFmpeg libraries, draw a simple overlay on each video frame,
+    // and re-encode back to MP4. This uses in-memory AVIO for both input and output, so no temp files.
+    // In the UMP path we can feed init+fragment MP4 bytes here and get back a processed MP4.
+    static bool processMp4WithFfmpegLibs(const std::vector<uint8_t>& inMp4,
+                                         std::vector<uint8_t>& outMp4,
+                                         const std::string& overlayText)
+    {
+        AVFormatContext* ifmtCtx = nullptr;
+        AVFormatContext* ofmtCtx = nullptr;
+        AVCodecContext* decCtx = nullptr;
+        AVCodecContext* encCtx = nullptr;
+        SwsContext* swsCtx = nullptr;
+        AVFrame* frame = nullptr;
+        AVFrame* rgbFrame = nullptr;
+        AVPacket* pkt = nullptr;
+        AVPacket* encPkt = nullptr;
+        AVIOContext* inAvio = nullptr;
+        AVIOContext* outAvio = nullptr;
+        uint8_t* inAvioBuf = nullptr;
+        uint8_t* outAvioBuf = nullptr;
+        int videoStreamIndex = -1;
+        bool ok = false;
+        MemBuffer mb{ inMp4.data(), inMp4.size(), 0 };
+        OutBuffer ob{ &outMp4 };
+
+        // ---------- Input: custom AVIO over in-memory MP4 ----------
+        const int avioBufSize = 64 * 1024;
+        inAvioBuf = static_cast<uint8_t*>(av_malloc(avioBufSize));
+        if (!inAvioBuf)
+            goto cleanup;
+
+        ifmtCtx = avformat_alloc_context();
+        if (!ifmtCtx)
+            goto cleanup;
+        inAvio = avio_alloc_context(
+            inAvioBuf, avioBufSize,
+            0,              // read-only
+            &mb,
+            &readPacket,
+            nullptr,
+            nullptr);
+        if (!inAvio)
+            goto cleanup;
+
+        ifmtCtx->pb = inAvio;
+        ifmtCtx->flags |= AVFMT_FLAG_CUSTOM_IO;
+
+        if (avformat_open_input(&ifmtCtx, nullptr, nullptr, nullptr) < 0)
+            goto cleanup;
+        if (avformat_find_stream_info(ifmtCtx, nullptr) < 0)
+            goto cleanup;
+
+        // Find first video stream.
+        for (unsigned int i = 0; i < ifmtCtx->nb_streams; ++i)
+        {
+            if (ifmtCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            {
+                videoStreamIndex = static_cast<int>(i);
+                break;
+            }
+        }
+        if (videoStreamIndex < 0)
+            goto cleanup;
+
+        {
+            AVCodecParameters* codecpar = ifmtCtx->streams[videoStreamIndex]->codecpar;
+            const AVCodec* dec = avcodec_find_decoder(codecpar->codec_id);
+            if (!dec)
+                goto cleanup;
+            decCtx = avcodec_alloc_context3(dec);
+            if (!decCtx)
+                goto cleanup;
+            if (avcodec_parameters_to_context(decCtx, codecpar) < 0)
+                goto cleanup;
+            if (avcodec_open2(decCtx, dec, nullptr) < 0)
+                goto cleanup;
+        }
+
+        // ---------- Output: custom AVIO that writes into outMp4 ----------
+        if (avformat_alloc_output_context2(&ofmtCtx, nullptr, "mp4", nullptr) < 0 || !ofmtCtx)
+            goto cleanup;
+
+        {
+            const AVCodec* enc = avcodec_find_encoder(decCtx->codec_id);
+            if (!enc)
+                goto cleanup;
+            AVStream* outStream = avformat_new_stream(ofmtCtx, enc);
+            if (!outStream)
+                goto cleanup;
+
+            encCtx = avcodec_alloc_context3(enc);
+            if (!encCtx)
+                goto cleanup;
+
+            encCtx->width = decCtx->width;
+            encCtx->height = decCtx->height;
+
+            // Choose a valid pixel format for the encoder without using deprecated AVCodec::pix_fmts.
+            if (decCtx->pix_fmt != AV_PIX_FMT_NONE)
+            {
+                // Fall back to the decoder's pixel format if it's valid.
+                encCtx->pix_fmt = decCtx->pix_fmt;
+            }
+            else
+            {
+                // As a last resort, use a common format.
+                encCtx->pix_fmt = AV_PIX_FMT_YUV420P;
+            }
+
+            // Ensure the encoder has a valid, non-zero timebase and framerate.
+            if (decCtx->framerate.num > 0 && decCtx->framerate.den > 0)
+            {
+                encCtx->time_base = av_inv_q(decCtx->framerate);
+                encCtx->framerate = decCtx->framerate;
+            }
+            else if (decCtx->time_base.num > 0 && decCtx->time_base.den > 0)
+            {
+                encCtx->time_base = decCtx->time_base;
+                encCtx->framerate = av_inv_q(decCtx->time_base);
+            }
+            else
+            {
+                // Fallback to a reasonable default if the decoder doesn't provide timing.
+                encCtx->time_base = AVRational{ 1, 30 };
+                encCtx->framerate = AVRational{ 30, 1 };
+            }
+
+            if (ofmtCtx->oformat->flags & AVFMT_GLOBALHEADER)
+                encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+            // Configure encoder options, especially for AV1/libaom, to avoid
+            // excessive memory usage and make rate control explicit.
+            {
+                AVDictionary* opts = nullptr;
+
+                if (enc->id == AV_CODEC_ID_AV1)
+                {
+                    // Use a constrained quality mode with an explicit CRF and
+                    // disable some heavy features that can blow up memory usage.
+                    av_dict_set(&opts, "usage", "realtime", 0);   // reduces lag buffers and complexity
+                    av_dict_set(&opts, "lag-in-frames", "0", 0);  // avoid allocating large lag buffers
+                    av_dict_set(&opts, "crf", "32", 0);           // explicit CRF
+                    av_dict_set(&opts, "b", "0", 0);              // pure CRF (no bitrate)
+                    av_dict_set(&opts, "enable-tpl", "0", 0);     // disable TPL model (saves RAM)
+                    av_dict_set(&opts, "row-mt", "1", 0);         // row multi-threading
+                    av_dict_set(&opts, "cpu-used", "7", 0);       // faster / lower memory
+
+                    // Also give FFmpeg's generic RC fields a sane default bitrate
+                    // so libaom does not fall back to its own heuristics.
+                    encCtx->bit_rate = 1500000;                   // ~1.5 Mbps
+                }
+
+                int openErr = avcodec_open2(encCtx, enc, &opts);
+                av_dict_free(&opts);
+                if (openErr < 0)
+                    goto cleanup;
+            }
+
+            if (avcodec_parameters_from_context(outStream->codecpar, encCtx) < 0)
+                goto cleanup;
+            outStream->time_base = encCtx->time_base;
+        }
+
+        outMp4.clear();
+        {
+            outAvioBuf = static_cast<uint8_t*>(av_malloc(avioBufSize));
+            if (!outAvioBuf)
+                goto cleanup;
+            ob.pos = 0;
+            outAvio = avio_alloc_context(
+                outAvioBuf, avioBufSize,
+                1,              // write
+                &ob,
+                nullptr,
+                &writePacket,
+                &seekPacket);
+            if (!outAvio)
+                goto cleanup;
+            ofmtCtx->pb = outAvio;
+            ofmtCtx->flags |= AVFMT_FLAG_CUSTOM_IO;
+        }
+
+        if (avformat_write_header(ofmtCtx, nullptr) < 0)
+            goto cleanup;
+
+        // Allocate frames.
+        frame = av_frame_alloc();
+        rgbFrame = av_frame_alloc();
+        pkt = av_packet_alloc();
+        encPkt = av_packet_alloc();
+        if (!frame || !rgbFrame || !pkt || !encPkt)
+            goto cleanup;
+
+        while (av_read_frame(ifmtCtx, pkt) >= 0)
+        {
+            if (pkt->stream_index != videoStreamIndex)
+            {
+                av_packet_unref(pkt);
+                continue;
+            }
+
+            if (avcodec_send_packet(decCtx, pkt) < 0)
+            {
+                av_packet_unref(pkt);
+                goto cleanup;
+            }
+            av_packet_unref(pkt);
+
+            while (true)
+            {
+                int ret = avcodec_receive_frame(decCtx, frame);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                    break;
+                if (ret < 0)
+                    goto cleanup;
+
+                // Convert to RGB24 for a simple overlay, then back to encoder pixel format.
+                swsCtx = sws_getCachedContext(
+                    swsCtx,
+                    frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
+                    frame->width, frame->height, AV_PIX_FMT_RGB24,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr);
+                if (!swsCtx)
+                    goto cleanup;
+
+                if (!rgbFrame->data[0])
+                {
+                    if (av_image_alloc(rgbFrame->data, rgbFrame->linesize,
+                        frame->width, frame->height, AV_PIX_FMT_RGB24, 1) < 0)
+                        goto cleanup;
+                }
+
+                sws_scale(swsCtx,
+                    frame->data, frame->linesize,
+                    0, frame->height,
+                    rgbFrame->data, rgbFrame->linesize);
+
+                drawSimpleOverlayRGB24(rgbFrame);
+
+                // Convert back to encoder pixel format.
+                SwsContext* swsBack = sws_getCachedContext(
+                    nullptr,
+                    frame->width, frame->height, AV_PIX_FMT_RGB24,
+                    frame->width, frame->height, encCtx->pix_fmt,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr);
+                if (!swsBack)
+                    goto cleanup;
+
+                AVFrame* encFrame = av_frame_alloc();
+                if (!encFrame)
+                {
+                    sws_freeContext(swsBack);
+                    goto cleanup;
+                }
+                encFrame->format = encCtx->pix_fmt;
+                encFrame->width = frame->width;
+                encFrame->height = frame->height;
+                if (av_frame_get_buffer(encFrame, 32) < 0)
+                {
+                    av_frame_free(&encFrame);
+                    sws_freeContext(swsBack);
+                    goto cleanup;
+                }
+
+                sws_scale(swsBack,
+                    rgbFrame->data, rgbFrame->linesize,
+                    0, frame->height,
+                    encFrame->data, encFrame->linesize);
+                sws_freeContext(swsBack);
+
+                encFrame->pts = frame->pts;
+
+                if (avcodec_send_frame(encCtx, encFrame) < 0)
+                {
+                    av_frame_free(&encFrame);
+                    goto cleanup;
+                }
+                av_frame_free(&encFrame);
+
+                while (true)
+                {
+                    int er = avcodec_receive_packet(encCtx, encPkt);
+                    if (er == AVERROR(EAGAIN) || er == AVERROR_EOF)
+                        break;
+                    if (er < 0)
+                        goto cleanup;
+
+                    encPkt->stream_index = 0;
+                    av_packet_rescale_ts(encPkt, decCtx->time_base, ofmtCtx->streams[0]->time_base);
+                    if (av_interleaved_write_frame(ofmtCtx, encPkt) < 0)
+                    {
+                        av_packet_unref(encPkt);
+                        goto cleanup;
+                    }
+                    av_packet_unref(encPkt);
+                }
+            }
+        }
+
+        // Flush encoder.
+        avcodec_send_frame(encCtx, nullptr);
+        while (true)
+        {
+            int er = avcodec_receive_packet(encCtx, encPkt);
+            if (er == AVERROR(EAGAIN) || er == AVERROR_EOF)
+                break;
+            if (er < 0)
+                goto cleanup;
+            encPkt->stream_index = 0;
+            av_packet_rescale_ts(encPkt, decCtx->time_base, ofmtCtx->streams[0]->time_base);
+            if (av_interleaved_write_frame(ofmtCtx, encPkt) < 0)
+            {
+                av_packet_unref(encPkt);
+                goto cleanup;
+            }
+            av_packet_unref(encPkt);
+        }
+
+        if (av_write_trailer(ofmtCtx) < 0)
+            goto cleanup;
+
+        ok = true;
+
+    cleanup:
+        if (pkt) av_packet_free(&pkt);
+        if (encPkt) av_packet_free(&encPkt);
+        if (frame) av_frame_free(&frame);
+        if (rgbFrame)
+        {
+            if (rgbFrame->data[0])
+                av_freep(&rgbFrame->data[0]);
+            av_frame_free(&rgbFrame);
+        }
+        if (swsCtx) sws_freeContext(swsCtx);
+        if (decCtx) avcodec_free_context(&decCtx);
+        if (encCtx) avcodec_free_context(&encCtx);
+        if (ifmtCtx) avformat_close_input(&ifmtCtx);
+        if (ifmtCtx)
+        {
+            // ifmtCtx owns inAvio via pb; free it after closing
+            AVIOContext* tmp = ifmtCtx->pb;
+            avformat_close_input(&ifmtCtx);
+            if (tmp)
+            {
+                if (tmp->buffer)
+                    av_freep(&tmp->buffer);
+                avio_context_free(&tmp);
+            }
+        }
+        if (ofmtCtx)
+        {
+            AVIOContext* tmp = ofmtCtx->pb;
+            av_write_trailer(ofmtCtx);
+            avformat_free_context(ofmtCtx);
+            if (tmp)
+            {
+                if (tmp->buffer)
+                    av_freep(&tmp->buffer);
+                avio_context_free(&tmp);
+            }
+        }
+        return ok;
     }
 
     static std::pair<int, int> readVarInt(const CompositeBuffer& buffer, int offset)
@@ -431,11 +1036,32 @@ private:
 
     void handleUmpPart(UmpAssembler& assem, const UmpPart& part)
     {
-        // Part IDs (from YouTube UMP): MEDIA=21, MEDIA_END=22
+        // Part IDs (from YouTube UMP): MEDIA_HEADER=20, MEDIA=21, MEDIA_END=22
+        const int UMP_PART_ID_MEDIA_HEADER = 20;
         const int UMP_PART_ID_MEDIA = 21;
         const int UMP_PART_ID_MEDIA_END = 22;
 
-        if (part.type == UMP_PART_ID_MEDIA)
+        if (part.type == UMP_PART_ID_MEDIA_HEADER)
+        {
+            uint8_t hdr = 0;
+            MediaHeaderMeta meta;
+            if (parseMediaHeaderMeta(part.data, hdr, meta))
+            {
+                // Merge into existing meta (keep any already-known fields if new parse didn't include them)
+                MediaHeaderMeta& cur = assem.metaByHeaderId[hdr];
+                if (meta.hasIsInitSeg) { cur.hasIsInitSeg = true; cur.isInitSeg = meta.isInitSeg; }
+                if (meta.hasItag) { cur.hasItag = true; cur.itag = meta.itag; }
+                if (meta.hasSeq) { cur.hasSeq = true; cur.sequenceNumber = meta.sequenceNumber; }
+
+                printf("[UMP] MediaHeader headerId=%u itag=%s is_init_seg=%s seq=%s\n",
+                    (unsigned)hdr,
+                    cur.hasItag ? std::to_string(cur.itag).c_str() : "?",
+                    cur.hasIsInitSeg ? (cur.isInitSeg ? "true" : "false") : "?",
+                    cur.hasSeq ? std::to_string(cur.sequenceNumber).c_str() : "?");
+            }
+            return;
+        }
+        else if (part.type == UMP_PART_ID_MEDIA)
         {
             uint8_t headerId = part.data.getUint8(0);
             auto split = part.data.split(1);
@@ -455,160 +1081,120 @@ private:
             if (segment.empty())
                 return;
 
-            if (looksLikeInitSegment(segment))
+            const auto itMeta = assem.metaByHeaderId.find(headerId);
+            const bool metaSaysInit = (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasIsInitSeg && itMeta->second.isInitSeg);
+            const bool heuristicInit = looksLikeInitSegment(segment);
+            const bool isInit = metaSaysInit || heuristicInit;
+
+            if (isInit)
             {
                 assem.initByHeaderId[headerId] = std::move(segment);
+                if (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag)
+                {
+                    assem.initByItag[itMeta->second.itag] = assem.initByHeaderId[headerId];
+                }
                 printf("[UMP] Stored init segment for headerId=%u (%zu bytes)\n",
                     (unsigned)headerId, assem.initByHeaderId[headerId].size());
+
+                // If we previously queued fragments waiting for init, replay them now.
+                auto itPending = assem.pendingByHeaderId.find(headerId);
+                if (itPending != assem.pendingByHeaderId.end() && !itPending->second.empty())
+                {
+                    printf("[UMP] Replaying %zu pending fragment(s) for headerId=%u now that init is available\n",
+                        itPending->second.size(), (unsigned)headerId);
+
+                    // Move pending out to avoid re-entrancy issues.
+                    auto pending = std::move(itPending->second);
+                    assem.pendingByHeaderId.erase(itPending);
+
+                    for (auto& frag : pending)
+                    {
+                        // Re-run MEDIA_END logic path by setting segment=frag (local copy) below.
+                        // We'll just inline the processing for simplicity.
+                        auto itInit2 = assem.initByHeaderId.find(headerId);
+                        if (itInit2 == assem.initByHeaderId.end() || itInit2->second.empty())
+                            break;
+
+                        std::vector<uint8_t> mp4;
+                        mp4.reserve(itInit2->second.size() + frag.size());
+                        mp4.insert(mp4.end(), itInit2->second.begin(), itInit2->second.end());
+                        mp4.insert(mp4.end(), frag.begin(), frag.end());
+
+                        std::vector<uint8_t> processedMp4;
+                        if (processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText))
+                        {
+                            printf("[UMP] Processed replayed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
+                                (unsigned)headerId, mp4.size(), processedMp4.size());
+                        }
+                        else
+                        {
+                            printf("[UMP] FFmpeg library processing failed (replayed) for headerId=%u\n",
+                                (unsigned)headerId);
+                        }
+                    }
+                }
                 return;
             }
 
+            // Find init by headerId first; if missing, try by itag (sometimes header ids change across init/media).
+            const std::vector<uint8_t>* init = nullptr;
             auto itInit = assem.initByHeaderId.find(headerId);
-            if (itInit == assem.initByHeaderId.end() || itInit->second.empty())
+            if (itInit != assem.initByHeaderId.end() && !itInit->second.empty())
+                init = &itInit->second;
+
+            if (!init && itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag)
             {
-                printf("[UMP] No init segment yet for headerId=%u, skipping media fragment (%zu bytes)\n",
-                    (unsigned)headerId, segment.size());
+                auto itInitItag = assem.initByItag.find(itMeta->second.itag);
+                if (itInitItag != assem.initByItag.end() && !itInitItag->second.empty())
+                    init = &itInitItag->second;
+            }
+
+            if (!init)
+            {
+                auto& q = assem.pendingByHeaderId[headerId];
+                const size_t segSize = segment.size();
+                if (q.size() < 6) // simple cap to avoid unbounded memory growth
+                    q.push_back(std::move(segment));
+
+                printf("[UMP] No init segment yet for headerId=%u, queued media fragment (%zu bytes). pending=%zu\n",
+                    (unsigned)headerId, segSize, q.size());
                 return;
             }
 
-            // Combine init + fragment (best-effort)
+            // Combine init + fragment and process with FFmpeg libraries.
             std::vector<uint8_t> mp4;
-            mp4.reserve(itInit->second.size() + segment.size());
-            mp4.insert(mp4.end(), itInit->second.begin(), itInit->second.end());
+            mp4.reserve(init->size() + segment.size());
+            mp4.insert(mp4.end(), init->begin(), init->end());
             mp4.insert(mp4.end(), segment.begin(), segment.end());
 
-            // Write to mp4 and extract first frame to PPM using ffmpeg.exe
-            CreateDirectoryA("ump_output", NULL);
-            uint64_t idx = assem.segIndexByHeaderId[headerId]++;
-            std::ostringstream mp4Path, ppmPath;
-            mp4Path << "ump_output\\h" << (unsigned)headerId << "_seg" << idx << ".mp4";
-            ppmPath << "ump_output\\h" << (unsigned)headerId << "_seg" << idx << "_frame0.ppm";
-
-            std::ofstream out(mp4Path.str(), std::ios::binary);
-            out.write(reinterpret_cast<const char*>(mp4.data()), (std::streamsize)mp4.size());
-            out.close();
-
-            if (runFFmpegExtractFirstFramePPM(mp4Path.str(), ppmPath.str()))
+            std::vector<uint8_t> processedMp4;
+            if (processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText))
             {
-                printf("[UMP] Extracted first frame: %s\n", ppmPath.str().c_str());
+                printf("[UMP] Processed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
+                    (unsigned)headerId, mp4.size(), processedMp4.size());
+                // TODO: repackage processedMp4 back into UMP MEDIA parts to feed modified video to the player.
             }
             else
             {
-                printf("[UMP] FFmpeg frame extract failed for: %s\n", mp4Path.str().c_str());
+                printf("[UMP] FFmpeg library processing failed for headerId=%u\n", (unsigned)headerId);
             }
         }
     }
 
-    bool processVideoWithFFmpeg(const char* inputData, size_t inputSize, 
-                                 std::vector<char>& outputData)
+    // Legacy path for non-UMP streams: still available as a fallback which uses the ffmpeg.exe CLI.
+    // New codepaths should prefer processMp4WithFfmpegLibs.
+    bool processVideoWithFFmpeg(const char* inputData, size_t inputSize,
+        std::vector<char>& outputData)
     {
-        char tempInputPath[MAX_PATH] = "";
-        char tempOutputPath[MAX_PATH];
-        GetTempFileNameA("TEMP", "vid", 0, tempInputPath);
-        GetTempFileNameA("TEMP", "vid", 0, tempOutputPath);
-
-        // Remove the ".tmp" extension
-        std::string inputFile = tempInputPath;
-        std::string outputFile = tempOutputPath;
-
-        size_t dotPos = inputFile.rfind(".tmp");
-        if (dotPos != std::string::npos) inputFile = inputFile.substr(0, dotPos);
-        dotPos = outputFile.rfind(".tmp");
-        if (dotPos != std::string::npos) outputFile = outputFile.substr(0, dotPos);
-
-        // Add the extension you want
-        inputFile += ".bin";
-        outputFile += ".mp4";
-
-        // Write input data to temp file
-        std::ofstream inputStream(inputFile, std::ios::binary);
-        if (!inputStream.is_open())
+        std::vector<uint8_t> inMp4(inputData, inputData + inputSize);
+        std::vector<uint8_t> outMp4;
+        if (!processMp4WithFfmpegLibs(inMp4, outMp4, g_overlayText))
         {
-            printf("Failed to create temp input file\n");
+            printf("FFmpeg library processing failed\n");
             return false;
         }
-        inputStream.write(inputData, inputSize);
-        inputStream.close();
-
-        // Build FFmpeg command
-        // Use fragmented MP4 for streaming compatibility
-        std::ostringstream cmd;
-        cmd << g_ffmpegPath << " -i \"" << inputFile << "\" "
-            << "-vf \"drawtext=text='" << g_overlayText 
-            << "':fontcolor=white:fontsize=24:x=10:y=10:box=1:boxcolor=black@0.5:boxborderw=2\" "
-            << "-c:v libx264 -preset ultrafast -crf 23 -tune zerolatency "
-            << "-c:a copy "
-            << "-movflags frag_keyframe+empty_moov+faststart "
-            << "-f mp4 -y \"" << outputFile << "\" 2>nul";
-
-        // Execute FFmpeg
-        STARTUPINFOA si = { sizeof(si) };
-        PROCESS_INFORMATION pi;
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-        
-        std::string cmdStr = cmd.str();
-        char* cmdLine = new char[cmdStr.length() + 1];
-        strcpy_s(cmdLine, cmdStr.length() + 1, cmdStr.c_str());
-
-        BOOL success = CreateProcessA(
-            NULL,
-            cmdLine,
-            NULL,
-            NULL,
-            TRUE,
-            CREATE_NO_WINDOW,
-            NULL,
-            NULL,
-            &si,
-            &pi
-        );
-
-        delete[] cmdLine;
-
-        if (!success)
-        {
-            printf("Failed to start FFmpeg process\n");
-            DeleteFileA(inputFile.c_str());
-            return false;
-        }
-
-        // Wait for FFmpeg to complete (with timeout)
-        DWORD waitResult = WaitForSingleObject(pi.hProcess, 30000);  // 30 second timeout
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-
-        if (waitResult != WAIT_OBJECT_0)
-        {
-            printf("FFmpeg process timeout or error\n");
-            DeleteFileA(inputFile.c_str());
-            DeleteFileA(outputFile.c_str());
-            return false;
-        }
-
-        // Read output file
-        std::ifstream outputStream(outputFile, std::ios::binary | std::ios::ate);
-        if (!outputStream.is_open())
-        {
-            printf("Failed to open output file\n");
-            DeleteFileA(inputFile.c_str());
-            DeleteFileA(outputFile.c_str());
-            return false;
-        }
-
-        size_t outputSize = outputStream.tellg();
-        outputStream.seekg(0, std::ios::beg);
-        
-        outputData.resize(outputSize);
-        outputStream.read(outputData.data(), outputSize);
-        outputStream.close();
-
-        // Cleanup temp files
-        DeleteFileA(inputFile.c_str());
-        DeleteFileA(outputFile.c_str());
-
-        return outputSize > 0;
+        outputData.assign(outMp4.begin(), outMp4.end());
+        return true;
     }
 
 public:
