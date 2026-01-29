@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <functional>
 #include <cctype>
+#include <ctime>
 #include <process.h>
 
 #include "ProtocolFilters.h"
@@ -49,6 +50,94 @@ std::string g_titlePrefix;
 std::string g_overlayText = "Custom Overlay";
 std::string g_ffmpegPath = "ffmpeg.exe";  // Path to FFmpeg executable
 
+// Set to true to skip UMP body/header modification and just forward the response (for diagnosing media request failures).
+static bool g_bypassUmpModification = false;
+
+// #region agent log
+static const char* g_agent_log_path = "d:/RCAL/workspace/Video_Streaming/.cursor/debug.log";
+static void agent_ensure_log_dir()
+{
+    static bool once = false;
+    if (once) return;
+    once = true;
+    const char* p = g_agent_log_path;
+    std::string dir;
+    std::string path(g_agent_log_path);
+    size_t last = path.find_last_of("/\\");
+    if (last != std::string::npos) { dir = path.substr(0, last); }
+    if (!dir.empty()) CreateDirectoryA(dir.c_str(), 0);
+}
+static const char* agent_log_path_used()
+{
+    static const char* chosen = nullptr;
+    static char pathBuf[MAX_PATH + 64] = "";
+    if (chosen) return chosen;
+    agent_ensure_log_dir();
+    std::ofstream t(g_agent_log_path, std::ios::app);
+    if (t) { t.close(); chosen = g_agent_log_path; goto write_pointer; }
+    if (GetModuleFileNameA(NULL, pathBuf, MAX_PATH)) {
+        std::string exe(pathBuf);
+        size_t last = exe.find_last_of("/\\");
+        if (last != std::string::npos) {
+            exe.resize(last + 1);
+            exe += "VideoStreamModifier_debug.log";
+            std::ofstream u(exe.c_str(), std::ios::app);
+            if (u) { u.close(); pathBuf[0] = '\0'; strncpy_s(pathBuf, exe.c_str(), _TRUNCATE); chosen = pathBuf; goto write_pointer; }
+        }
+    }
+    pathBuf[0] = '\0';
+    if (GetTempPathA(MAX_PATH, pathBuf)) {
+        strcat_s(pathBuf, "VideoStreamModifier_debug.log");
+        chosen = pathBuf;
+    }
+    else {
+        chosen = g_agent_log_path;
+    }
+write_pointer:
+    {
+        std::string ptrPath(g_agent_log_path);
+        size_t last = ptrPath.find_last_of("/\\");
+        if (last != std::string::npos) {
+            ptrPath.resize(last + 1);
+            ptrPath += "debug_log_path.txt";
+            std::ofstream ptr(ptrPath.c_str(), std::ios::out);
+            if (ptr) { ptr << chosen; ptr.close(); }
+        }
+    }
+    return chosen;
+}
+static void agent_log_entry(const char* hypothesisId, const char* location, int objType, int isReadOnly, size_t contentSize)
+{
+    const char* path = agent_log_path_used();
+    std::ofstream f(path, std::ios::app);
+    if (f) {
+        f << "{\"sessionId\":\"debug-session\",\"hypothesisId\":\"" << hypothesisId << "\",\"location\":\"" << location << "\",\"message\":\"dataAvailable response\",\"data\":{"
+            << "\"objType\":" << objType << ",\"isReadOnly\":" << isReadOnly << ",\"contentSize\":" << contentSize << "},\"timestamp\":" << (static_cast<long long>(time(nullptr)) * 1000) << "}\n";
+        f.close();
+    }
+}
+static void agent_log_write(const char* hypothesisId, const char* location, int isReadOnly, size_t totalRewritten, tStreamPos streamBefore, tStreamSize written, tStreamPos streamAfter, int headerOk)
+{
+    const char* path = agent_log_path_used();
+    std::ofstream f(path, std::ios::app);
+    if (f) {
+        f << "{\"sessionId\":\"debug-session\",\"hypothesisId\":\"" << hypothesisId << "\",\"location\":\"" << location << "\",\"message\":\"after write\",\"data\":{"
+            << "\"isReadOnly\":" << isReadOnly << ",\"totalRewritten\":" << totalRewritten << ",\"streamBefore\":" << streamBefore << ",\"written\":" << written
+            << ",\"streamAfter\":" << streamAfter << ",\"headerOk\":" << headerOk << "},\"timestamp\":" << (static_cast<long long>(time(nullptr)) * 1000) << "}\n";
+        f.close();
+    }
+}
+static void agent_log_post(const char* hypothesisId, const char* location)
+{
+    const char* path = agent_log_path_used();
+    std::ofstream f(path, std::ios::app);
+    if (f) {
+        f << "{\"sessionId\":\"debug-session\",\"hypothesisId\":\"" << hypothesisId << "\",\"location\":\"" << location << "\",\"message\":\"pf_postObject\",\"timestamp\":" << (static_cast<long long>(time(nullptr)) * 1000) << "}\n";
+        f.close();
+    }
+}
+// #endregion
+
 // HTTP/1.1: ENDPOINT_ID -> FIFO of request URLs (best-effort; only reliable without pipelining)
 static std::map<nfapi::ENDPOINT_ID, std::deque<std::string>> g_http1RequestQueue;
 // HTTP/2: ENDPOINT_ID -> (streamId -> request URL)
@@ -62,7 +151,7 @@ struct VideoStreamBuffer {
     size_t contentLength;  // Content-Length from header, 0 if chunked
     size_t processedSize;  // Amount of data already processed
     bool isProcessing;  // Flag to prevent concurrent processing
-    
+
     VideoStreamBuffer() : isVideoStream(false), contentLength(0), processedSize(0), isProcessing(false) {}
 };
 
@@ -142,8 +231,8 @@ private:
     bool isYouTubeVideoURL(const std::string& url)
     {
         return (url.find("googlevideo.com") != std::string::npos ||
-                url.find("youtube.com") != std::string::npos ||
-                url.find("ytimg.com") != std::string::npos);
+            url.find("youtube.com") != std::string::npos ||
+            url.find("ytimg.com") != std::string::npos);
     }
 
     // Overload that accepts already-read header (more efficient)
@@ -161,7 +250,7 @@ private:
             PFHeaderField* pHostField = h->findFirstField("Host");
             if (pHostField)
                 host = pHostField->value();
-            
+
             // Get path from status line (first line: "GET /path HTTP/1.1")
             PFStream* pStatusStream = object->getStream(HS_STATUS);
             if (pStatusStream && pStatusStream->size() > 0)
@@ -170,7 +259,7 @@ private:
                 pStatusStream->seek(0, FILE_BEGIN);
                 pStatusStream->read(statusBuf.data(), (tStreamSize)pStatusStream->size());
                 statusBuf[pStatusStream->size()] = '\0';
-                
+
                 std::string statusLine(statusBuf.data());
                 // Parse "GET /path HTTP/1.1" format
                 size_t firstSpace = statusLine.find(' ');
@@ -183,7 +272,7 @@ private:
                     }
                 }
             }
-            
+
             if (!host.empty() && !path.empty())
             {
                 url = "http://" + host + path;
@@ -204,13 +293,13 @@ private:
                 if (pHostField)
                     host = pHostField->value();
             }
-            
+
             // Get original request line from custom header
             PFHeaderField* pRequestField = h->findFirstField("X-EXHDR-REQUEST");
             if (pRequestField)
             {
                 std::string requestLine = pRequestField->value();
-                
+
                 // Parse request line: "GET /path HTTP/1.1" or "POST http://full.url/path HTTP/1.1"
                 size_t firstSpace = requestLine.find(' ');
                 if (firstSpace != std::string::npos)
@@ -219,7 +308,7 @@ private:
                     if (secondSpace != std::string::npos)
                     {
                         path = requestLine.substr(firstSpace + 1, secondSpace - firstSpace - 1);
-                        
+
                         // Check if path already contains a full URL (starts with http:// or https://)
                         if (path.find("http://") == 0 || path.find("https://") == 0)
                         {
@@ -244,11 +333,11 @@ private:
             PFHeaderField* pHostField = h->findFirstField(":authority");
             if (pHostField)
                 host = pHostField->value();
-            
+
             PFHeaderField* pPathField = h->findFirstField(":path");
             if (pPathField)
                 path = pPathField->value();
-            
+
             if (!host.empty() && !path.empty())
             {
                 url = "http://" + host + path;
@@ -269,7 +358,7 @@ private:
             if (!host.empty() && !path.empty())
                 url = "http://" + host + path;
         }
-        
+
         return url;
     }
 
@@ -286,7 +375,7 @@ private:
 
     static std::string sanitizeFilename(std::string s)
     {
-        for (char &c : s)
+        for (char& c : s)
         {
             if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.'))
                 c = '_';
@@ -300,9 +389,9 @@ private:
         // MP4 box: [0..3]=size, [4..7]=type
         if (bytes.size() < 8) return false;
         return bytes[4] == static_cast<uint8_t>(type4[0]) &&
-               bytes[5] == static_cast<uint8_t>(type4[1]) &&
-               bytes[6] == static_cast<uint8_t>(type4[2]) &&
-               bytes[7] == static_cast<uint8_t>(type4[3]);
+            bytes[5] == static_cast<uint8_t>(type4[1]) &&
+            bytes[6] == static_cast<uint8_t>(type4[2]) &&
+            bytes[7] == static_cast<uint8_t>(type4[3]);
     }
 
     static bool looksLikeInitSegment(const std::vector<uint8_t>& bytes)
@@ -620,8 +709,8 @@ private:
     // and re-encode back to MP4. This uses in-memory AVIO for both input and output, so no temp files.
     // In the UMP path we can feed init+fragment MP4 bytes here and get back a processed MP4.
     static bool processMp4WithFfmpegLibs(const std::vector<uint8_t>& inMp4,
-                                         std::vector<uint8_t>& outMp4,
-                                         const std::string& overlayText)
+        std::vector<uint8_t>& outMp4,
+        const std::string& overlayText)
     {
         AVFormatContext* ifmtCtx = nullptr;
         AVFormatContext* ofmtCtx = nullptr;
@@ -843,12 +932,13 @@ private:
                 if (!swsCtx)
                     goto cleanup;
 
-                if (!rgbFrame->data[0])
-                {
-                    if (av_image_alloc(rgbFrame->data, rgbFrame->linesize,
-                        frame->width, frame->height, AV_PIX_FMT_RGB24, 1) < 0)
-                        goto cleanup;
-                }
+                rgbFrame->format = AV_PIX_FMT_RGB24;
+                rgbFrame->width = frame->width;
+                rgbFrame->height = frame->height;
+                if (av_frame_get_buffer(rgbFrame, 32) < 0)
+                    goto cleanup;
+                if (av_frame_make_writable(rgbFrame) < 0)
+                    goto cleanup;
 
                 sws_scale(swsCtx,
                     frame->data, frame->linesize,
@@ -944,11 +1034,7 @@ private:
         if (encPkt) av_packet_free(&encPkt);
         if (frame) av_frame_free(&frame);
         if (rgbFrame)
-        {
-            if (rgbFrame->data[0])
-                av_freep(&rgbFrame->data[0]);
-            av_frame_free(&rgbFrame);
-        }
+            av_frame_free(&rgbFrame);  // frame owns buffer from av_frame_get_buffer
         if (swsCtx) sws_freeContext(swsCtx);
         if (decCtx) avcodec_free_context(&decCtx);
         if (encCtx) avcodec_free_context(&encCtx);
@@ -1084,6 +1170,23 @@ private:
         }
     }
 
+    // YouTube audio-only itags (Opus, AAC, Vorbis). We pass these through without FFmpeg processing.
+    static bool isAudioOnlyItag(int32_t itag)
+    {
+        switch (itag)
+        {
+        case 251: case 250: case 249:  // Opus
+        case 140: case 139:            // AAC
+        case 171: case 172:            // Vorbis
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // A single YouTube UMP response contains both audio and video tracks (multiple headerIds / itags).
+    // We preserve all tracks: every MEDIA_HEADER and every MEDIA/MEDIA_END is re-emitted so the browser
+    // receives both audio and video. Audio tracks are passed through; video tracks are processed (overlay).
     void handleUmpPart(UmpAssembler& assem, const UmpPart& part)
     {
         // Part IDs (from YouTube UMP): MEDIA_HEADER=20, MEDIA=21, MEDIA_END=22
@@ -1161,10 +1264,10 @@ private:
                     auto pending = std::move(itPending->second);
                     assem.pendingByHeaderId.erase(itPending);
 
+                    const bool replayIsAudio = (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag
+                        && isAudioOnlyItag(itMeta->second.itag));
                     for (auto& frag : pending)
                     {
-                        // Re-run MEDIA_END logic path by setting segment=frag (local copy) below.
-                        // We'll just inline the processing for simplicity.
                         auto itInit2 = assem.initByHeaderId.find(headerId);
                         if (itInit2 == assem.initByHeaderId.end() || itInit2->second.empty())
                             break;
@@ -1175,16 +1278,29 @@ private:
                         mp4.insert(mp4.end(), frag.begin(), frag.end());
 
                         std::vector<uint8_t> processedMp4;
-                        if (processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText))
+                        if (replayIsAudio)
+                            processedMp4 = mp4;
+                        else if (processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText))
                         {
                             printf("[UMP] Processed replayed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
                                 (unsigned)headerId, mp4.size(), processedMp4.size());
                         }
                         else
                         {
-                            printf("[UMP] FFmpeg library processing failed (replayed) for headerId=%u\n",
+                            printf("[UMP] FFmpeg library processing failed (replayed) for headerId=%u, falling back to original\n",
                                 (unsigned)headerId);
+                            processedMp4 = std::move(mp4);
                         }
+
+                        // Emit MEDIA + MEDIA_END so the browser receives the replayed segment.
+                        std::vector<uint8_t> mediaData;
+                        mediaData.reserve(1 + processedMp4.size());
+                        mediaData.push_back(headerId);
+                        mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
+                        umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+                        std::vector<uint8_t> mediaEndData(1);
+                        mediaEndData[0] = headerId;
+                        umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaEndData);
                     }
                 }
                 return;
@@ -1215,24 +1331,34 @@ private:
                 return;
             }
 
-            // Combine init + fragment and process with FFmpeg libraries.
+            // Combine init + fragment. Both audio and video tracks are forwarded; audio is passed through,
+            // video is processed with FFmpeg (overlay) so the browser gets a full audio+video stream.
             std::vector<uint8_t> mp4;
             mp4.reserve(init->size() + segment.size());
             mp4.insert(mp4.end(), init->begin(), init->end());
             mp4.insert(mp4.end(), segment.begin(), segment.end());
 
             std::vector<uint8_t> processedMp4;
-            bool processedOk = processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText);
-            if (processedOk)
+            const bool isAudio = (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag
+                && isAudioOnlyItag(itMeta->second.itag));
+            if (isAudio)
             {
-                printf("[UMP] Processed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
-                    (unsigned)headerId, mp4.size(), processedMp4.size());
+                processedMp4 = mp4;
             }
             else
             {
-                printf("[UMP] FFmpeg library processing failed for headerId=%u, falling back to original bytes\n",
-                    (unsigned)headerId);
-                processedMp4 = std::move(mp4);
+                bool processedOk = processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText);
+                if (processedOk)
+                {
+                    printf("[UMP] Processed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
+                        (unsigned)headerId, mp4.size(), processedMp4.size());
+                }
+                else
+                {
+                    printf("[UMP] FFmpeg library processing failed for headerId=%u, falling back to original bytes\n",
+                        (unsigned)headerId);
+                    processedMp4 = std::move(mp4);
+                }
             }
 
             // Repackage the (possibly processed) MP4 back into UMP MEDIA + MEDIA_END
@@ -1334,16 +1460,6 @@ public:
                 }
             }
         }
- 
-        // Clean up buffer if this is the final data for a connection
-        if (object->isReadOnly())
-        {
-            // Clean up buffer when connection is done
-            m_videoBuffers.erase(id);
-            g_http1RequestQueue.erase(id);
-            g_http2StreamUrl.erase(id);
-            return;
-        }
 
         // --- Handle responses (video data is here) ---
         if (objType == OT_HTTP_RESPONSE || objType == OT_HTTP2_RESPONSE)
@@ -1356,8 +1472,21 @@ public:
             if (readHeader(object, headerIndex, h))
             {
                 PFHeaderField* pContentTypeField = h.findFirstField("Content-Type");
-
                 std::string url = getURLFromHeader(object, &h); // often works due to X-EXHDR-* / x-exhdr-*
+                // Log every response so we see failing media requests and where the log file is created
+                {
+                    const char* path = agent_log_path_used();
+                    std::ofstream f(path, std::ios::app);
+                    if (f) {
+                        std::string ct = pContentTypeField ? pContentTypeField->value() : "";
+                        for (size_t i = 0; i < ct.size(); ++i) if (ct[i] == '"' || ct[i] == '\\') { ct.insert(i, 1, '\\'); ++i; }
+                        size_t streamSz = 0;
+                        PFStream* ps = object->getStream(contentIndex);
+                        if (ps) streamSz = (size_t)ps->size();
+                        f << "{\"message\":\"response\",\"objType\":" << (int)objType << ",\"contentType\":\"" << ct << "\",\"urlLen\":" << url.size() << ",\"streamSize\":" << streamSz << ",\"isReadOnly\":" << (object->isReadOnly() ? 1 : 0) << "}\n";
+                        f.close();
+                    }
+                }
 
                 // HTTP/2: match by stream id (responses may arrive out of order)
                 if (isHttp2)
@@ -1390,11 +1519,11 @@ public:
                         it->second.pop_front();
                     }
                 }
-                
+
                 // Check if this is a YouTube video response
                 bool isYouTube = isYouTubeVideoURL(url);
                 bool isVideo = pContentTypeField && isVideoContentType(pContentTypeField->value());
-                
+
                 if (pContentTypeField && isYouTube && isVideo)
                 {
                     // Check if this is video content
@@ -1406,47 +1535,79 @@ public:
                         // --- UMP path: parse UMP and dump first decoded frame per completed segment ---
                         if (contentType.find("application/vnd.yt-ump") != std::string::npos)
                         {
-                            std::string sid = isHttp2 ? getHttp2StreamId(object) : "";
-                            std::ostringstream key;
-                            key << id << ":" << (sid.empty() ? "h1" : sid) << ":" << sanitizeFilename(url);
-                            std::string k = key.str();
-
-                            size_t& processed = m_umpProcessedSize[k];
-                            size_t currentSize = (size_t)pStream->size();
-                            if (currentSize > processed)
+                            // #region agent log
+                            agent_log_entry("B,C,E", "VideoStreamModifier.cpp:dataAvailable UMP entry", (int)objType, object->isReadOnly() ? 1 : 0, (size_t)pStream->size());
+                            // #endregion
+                            if (g_bypassUmpModification)
                             {
-                                size_t delta = currentSize - processed;
-                                std::vector<uint8_t> newBytes(delta);
-                                pStream->seek((tStreamPos)processed, FILE_BEGIN);
-                                pStream->read(reinterpret_cast<char*>(newBytes.data()), (tStreamSize)delta);
-                                processed = currentSize;
-
-                        UmpAssembler& assem = m_ump[k];
-                        assem.buffer.append(newBytes);
-
-                        // Before consuming parts, remember how many rewritten bytes we have already
-                        // emitted so we can compute the delta for this chunk.
-                        const size_t prevRewrittenSize = assem.rewrittenUmpOut.size();
-
-                        consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part); });
-
-                        // After processing, any new bytes appended to rewrittenUmpOut correspond
-                        // to this chunk of input. Replace the HTTP body with the full rewritten
-                        // stream so far so the browser gets the complete response (reset() clears
-                        // the stream, so we must write the entire body each time).
-                        if (assem.rewrittenUmpOut.size() > prevRewrittenSize)
-                        {
-                            const size_t totalRewritten = assem.rewrittenUmpOut.size();
-                            if (totalRewritten > 0)
-                            {
-                                pStream->reset();
-                                pStream->write(
-                                    reinterpret_cast<const char*>(assem.rewrittenUmpOut.data()),
-                                    (tStreamSize)totalRewritten);
-                                assem.rewrittenSentOffset = totalRewritten;
+                                // Bypass: do not modify; post as-is to test if media failures are caused by our modification.
                             }
-                        }
-                     }
+                            else
+                            {
+                                std::string sid = isHttp2 ? getHttp2StreamId(object) : "";
+                                std::ostringstream key;
+                                key << id << ":" << (sid.empty() ? "h1" : sid) << ":" << sanitizeFilename(url);
+                                std::string k = key.str();
+
+                                size_t& processed = m_umpProcessedSize[k];
+                                size_t currentSize = (size_t)pStream->size();
+                                if (currentSize > processed)
+                                {
+                                    size_t delta = currentSize - processed;
+                                    std::vector<uint8_t> newBytes(delta);
+                                    pStream->seek((tStreamPos)processed, FILE_BEGIN);
+                                    pStream->read(reinterpret_cast<char*>(newBytes.data()), (tStreamSize)delta);
+                                    processed = currentSize;
+
+                                    UmpAssembler& assem = m_ump[k];
+                                    assem.buffer.append(newBytes);
+
+                                    // Before consuming parts, remember how many rewritten bytes we have already
+                                    // emitted so we can compute the delta for this chunk.
+                                    const size_t prevRewrittenSize = assem.rewrittenUmpOut.size();
+
+                                    consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part); });
+
+                                    // After processing, any new bytes appended to rewrittenUmpOut correspond
+                                    // to this chunk of input. Replace the HTTP body with the full rewritten
+                                    // stream so far so the browser gets the complete response (reset() clears
+                                    // the stream, so we must write the entire body each time).
+                                    if (assem.rewrittenUmpOut.size() > prevRewrittenSize)
+                                    {
+                                        const size_t totalRewritten = assem.rewrittenUmpOut.size();
+                                        if (totalRewritten > 0)
+                                        {
+                                            // Diagnostic: if object is read-only, our writes may be ignored and the browser gets nothing.
+                                            const bool objReadOnly = object->isReadOnly();
+                                            const tStreamPos streamSizeBefore = pStream->size();
+                                            if (objReadOnly)
+                                                printf("[UMP] WARNING: object is read-only; header/body writes may be ignored (browser may see failed request).\n");
+
+                                            // Update Content-Length to match the new body size so the browser
+                                            // receives the full response (otherwise the response fails or truncates).
+                                            h.removeFields("Content-Length", true);
+                                            h.addField("Content-Length", std::to_string(totalRewritten));
+                                            // Prefer fixed length; remove chunked so the client reads exactly Content-Length bytes.
+                                            h.removeFields("Transfer-Encoding", true);
+                                            PFStream* pHeaderStream = object->getStream(headerIndex);
+                                            const bool headerOk = pHeaderStream && pf_writeHeader(pHeaderStream, &h);
+                                            pStream->reset();
+                                            const tStreamSize written = pStream->write(
+                                                reinterpret_cast<const char*>(assem.rewrittenUmpOut.data()),
+                                                (tStreamSize)totalRewritten);
+                                            const tStreamPos streamSizeAfter = pStream->size();
+
+                                            if (!headerOk || written != (tStreamSize)totalRewritten || streamSizeAfter != (tStreamPos)totalRewritten)
+                                                printf("[UMP] WARNING: write result headerOk=%d written=%lld totalRewritten=%zu streamSizeAfter=%lld (browser may see failed/empty response).\n",
+                                                    (int)headerOk, (long long)written, totalRewritten, (long long)streamSizeAfter);
+                                            // #region agent log
+                                            agent_log_write("A,D", "VideoStreamModifier.cpp:after UMP write", objReadOnly ? 1 : 0, totalRewritten, streamSizeBefore, written, streamSizeAfter, headerOk ? 1 : 0);
+                                            // #endregion
+                                            assem.rewrittenSentOffset = totalRewritten;
+                                        }
+                                    }
+                                }
+                            }  // !g_bypassUmpModification
                         }
                         else
                         {
@@ -1475,7 +1636,17 @@ public:
             }
         }
 
+        // #region agent log
+        agent_log_post("C,E", "VideoStreamModifier.cpp:before pf_postObject");
+        // #endregion
         pf_postObject(id, object);
+
+        if (object->isReadOnly())
+        {
+            m_videoBuffers.erase(id);
+            g_http1RequestQueue.erase(id);
+            g_http2StreamUrl.erase(id);
+        }
     }
 };
 
@@ -1487,7 +1658,7 @@ int main(int argc, char* argv[])
     g_titlePrefix += " ";
     g_overlayText = "Test Overlay";
     // Configure overlay text (can be set via command line or environment variable)
-    
+
 
     // Configure FFmpeg path (can be set via environment variable)
 
