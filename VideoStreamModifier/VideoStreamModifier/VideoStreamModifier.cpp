@@ -1431,21 +1431,22 @@ public:
                         consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part); });
 
                         // After processing, any new bytes appended to rewrittenUmpOut correspond
-                        // to this chunk of input. Replace the HTTP body with those bytes so the
-                        // browser sees the modified UMP stream instead of the original one.
+                        // to this chunk of input. Replace the HTTP body with the full rewritten
+                        // stream so far so the browser gets the complete response (reset() clears
+                        // the stream, so we must write the entire body each time).
                         if (assem.rewrittenUmpOut.size() > prevRewrittenSize)
                         {
-                            size_t available = assem.rewrittenUmpOut.size() - assem.rewrittenSentOffset;
-                            if (available > 0)
+                            const size_t totalRewritten = assem.rewrittenUmpOut.size();
+                            if (totalRewritten > 0)
                             {
                                 pStream->reset();
                                 pStream->write(
-                                    reinterpret_cast<const char*>(assem.rewrittenUmpOut.data() + assem.rewrittenSentOffset),
-                                    (tStreamSize)available);
-                                assem.rewrittenSentOffset = assem.rewrittenUmpOut.size();
+                                    reinterpret_cast<const char*>(assem.rewrittenUmpOut.data()),
+                                    (tStreamSize)totalRewritten);
+                                assem.rewrittenSentOffset = totalRewritten;
                             }
                         }
-                            }
+                     }
                         }
                         else
                         {
