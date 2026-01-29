@@ -638,6 +638,7 @@ private:
         uint8_t* outAvioBuf = nullptr;
         int videoStreamIndex = -1;
         bool ok = false;
+        bool outputHeaderWritten = false;  // only call av_write_trailer if this is true
         MemBuffer mb{ inMp4.data(), inMp4.size(), 0 };
         OutBuffer ob{ &outMp4 };
 
@@ -800,6 +801,7 @@ private:
 
         if (avformat_write_header(ofmtCtx, nullptr) < 0)
             goto cleanup;
+        outputHeaderWritten = true;
 
         // Allocate frames.
         frame = av_frame_alloc();
@@ -934,10 +936,8 @@ private:
             av_packet_unref(encPkt);
         }
 
-        if (av_write_trailer(ofmtCtx) < 0)
-            goto cleanup;
-
         ok = true;
+        // av_write_trailer is called once in cleanup (only when outputHeaderWritten), not here, to avoid double call
 
     cleanup:
         if (pkt) av_packet_free(&pkt);
@@ -955,26 +955,26 @@ private:
         if (ifmtCtx) avformat_close_input(&ifmtCtx);
         if (ifmtCtx)
         {
-            // ifmtCtx owns inAvio via pb; free it after closing
-            AVIOContext* tmp = ifmtCtx->pb;
+            // avformat_close_input frees the context and its pb; do not free pb again
             avformat_close_input(&ifmtCtx);
-            if (tmp)
-            {
-                if (tmp->buffer)
-                    av_freep(&tmp->buffer);
-                avio_context_free(&tmp);
-            }
         }
         if (ofmtCtx)
         {
             AVIOContext* tmp = ofmtCtx->pb;
-            av_write_trailer(ofmtCtx);
+            if (outputHeaderWritten)
+            {
+                if (av_write_trailer(ofmtCtx) < 0)
+                    ok = false;  // trailer write failed; output may be incomplete
+            }
+            ofmtCtx->pb = nullptr;  // we own pb for muxing; free it ourselves so avformat_free_context doesn't touch it
             avformat_free_context(ofmtCtx);
             if (tmp)
             {
-                if (tmp->buffer)
-                    av_freep(&tmp->buffer);
-                avio_context_free(&tmp);
+                avio_context_free(&tmp);  // frees context; buffer may have been replaced by libavformat (e.g. if >32KB), so don't touch tmp->buffer
+            }
+            if (outAvioBuf)
+            {
+                av_freep(&outAvioBuf);  // our allocation from avio_alloc_context
             }
         }
         return ok;
