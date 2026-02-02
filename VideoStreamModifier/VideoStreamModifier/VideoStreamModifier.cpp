@@ -1,5 +1,8 @@
 // Adds a prefix to the titles of HTML pages.
 //
+// UMP (YouTube) parsing: part IDs, MediaHeader (is_init_seg), and init vs media segment
+// semantics follow the googlevideo library (googlevideo protos, googlevideo-c UmpWriter/UmpReader,
+// googlevideo SabrStream handleMediaHeader/Media/MediaEnd).
 
 #include <crtdbg.h>
 #include <windows.h>
@@ -50,8 +53,17 @@ std::string g_titlePrefix;
 std::string g_overlayText = "Custom Overlay";
 std::string g_ffmpegPath = "ffmpeg.exe";  // Path to FFmpeg executable
 
-// Set to true to skip UMP body/header modification and just forward the response (for diagnosing media request failures).
+// Set to true to skip UMP parsing entirely (no save, no modify; response passes through as-is).
+// Must be false when dumping so we parse UMP to save video to file.
 static bool g_bypassUmpModification = false;
+
+// Save incoming video stream as playable fragmented MP4 for this many seconds (0 = disabled).
+// Used to verify MITM capture/decode: init + media fragments are written to captured_<timestamp>_<key>.mp4.
+static int g_saveStreamToMp4ForSeconds = 100;
+
+// When true: only dump YouTube video stream to file; no response is ever modified (all responses pass through unchanged).
+// When false: apply overlay and rewrite response bodies (original behavior).
+static bool g_saveOnlyNoModify = true;
 
 // #region agent log
 static const char* g_agent_log_path = "d:/RCAL/workspace/Video_Streaming/.cursor/debug.log";
@@ -192,11 +204,25 @@ private:
         std::vector<uint8_t> rewrittenUmpOut;
         // Number of bytes already sent downstream from rewrittenUmpOut.
         size_t rewrittenSentOffset = 0;
+        // Number of UMP parts seen for this stream (for logging).
+        size_t partCount = 0;
     };
 
     // Keyed by endpoint + (http2 stream id if present) + url (best-effort uniqueness)
     std::map<std::string, UmpAssembler> m_ump;
     std::map<std::string, size_t> m_umpProcessedSize;
+
+    // Save incoming video stream as playable fMP4 for g_saveStreamToMp4ForSeconds (one file per stream key).
+    struct SaveMp4State
+    {
+        std::ofstream file;
+        std::string rawFilePath;  // path of the raw fMP4 we wrote (for FFmpeg conversion when done)
+        time_t startTime = 0;
+        uint8_t videoHeaderId = 0;
+        bool initWritten = false;
+        bool done = false;
+    };
+    std::map<std::string, SaveMp4State> m_saveMp4;
 
     static bool readHeader(PFObject* object, int streamIndex, PFHeader& h)
     {
@@ -384,6 +410,38 @@ private:
         return s;
     }
 
+    // Normalize URL so all segment/chunk requests for the same video stream get the same key.
+    // Strip query params that vary per chunk (range, rn, sq) so we append all chunks to one file.
+    static std::string normalizeUrlForSaveKey(const std::string& url)
+    {
+        size_t q = url.find('?');
+        if (q == std::string::npos)
+            return url;
+        std::string path = url.substr(0, q);
+        std::string query = url.substr(q + 1);
+        if (query.empty())
+            return path;
+        std::string out;
+        out.reserve(query.size());
+        for (size_t i = 0; i < query.size(); )
+        {
+            size_t amp = query.find('&', i);
+            size_t end = (amp == std::string::npos) ? query.size() : amp;
+            size_t eq = query.find('=', i);
+            if (eq != std::string::npos && eq < end)
+            {
+                std::string name = query.substr(i, eq - i);
+                if (name != "range" && name != "rn" && name != "sq")
+                {
+                    if (!out.empty()) out += '&';
+                    out += query.substr(i, end - i);
+                }
+            }
+            i = end + (end < query.size() ? 1 : 0);
+        }
+        return out.empty() ? path : (path + "?" + out);
+    }
+
     static bool startsWithBoxType(const std::vector<uint8_t>& bytes, const char* type4)
     {
         // MP4 box: [0..3]=size, [4..7]=type
@@ -394,11 +452,13 @@ private:
             bytes[7] == static_cast<uint8_t>(type4[3]);
     }
 
+    // Fallback when MEDIA_HEADER.is_init_seg is missing. Per googlevideo (SabrStream handleMediaHeader),
+    // init is authoritative from MediaHeader.isInitSeg; fMP4 init = ftyp+moov, media = styp/moof+mdat.
     static bool looksLikeInitSegment(const std::vector<uint8_t>& bytes)
     {
-        // Common init segment starts with ftyp then moov, but YouTube init segments sometimes
-        // begin with other boxes. We keep this as a heuristic fallback only.
-        return startsWithBoxType(bytes, "ftyp") || startsWithBoxType(bytes, "styp") || startsWithBoxType(bytes, "moov");
+        if (startsWithBoxType(bytes, "moof"))
+            return false;  // Movie fragment = media segment (googlevideo media segment shape)
+        return startsWithBoxType(bytes, "ftyp") || startsWithBoxType(bytes, "moov");
     }
 
     static void appendCompositeToVector(const CompositeBuffer& b, std::vector<uint8_t>& out)
@@ -458,7 +518,7 @@ private:
         }
     }
 
-    // --- Minimal UMP writer (local; mirrors googlevideo-c/googlevideo/core/UmpWriter.cpp) ---
+    // --- Minimal UMP writer (mirrors googlevideo-c googlevideo/core/UmpWriter.cpp, googlevideo UmpWriter.ts) ---
     static void umpWriteVarInt(std::vector<uint8_t>& out, uint32_t value)
     {
         if (value < 128)
@@ -502,8 +562,8 @@ private:
         out.insert(out.end(), partData.begin(), partData.end());
     }
 
-    // Minimal protobuf decode for video_streaming.MediaHeader (we only need a few varint fields):
-    // header_id (1), itag (3), is_init_seg (8), sequence_number (9)
+    // Minimal protobuf decode for video_streaming.MediaHeader (googlevideo protos/video_streaming/media_header.proto).
+    // Fields: header_id (1), itag (3), is_init_seg (8), sequence_number (9). Init segment is authoritative from is_init_seg.
     static bool parseMediaHeaderMeta(const CompositeBuffer& buf, uint8_t& headerIdOut, MediaHeaderMeta& metaOut)
     {
         const std::vector<uint8_t> bytes = compositeToVector(buf);
@@ -596,6 +656,49 @@ private:
             return false;
 
         DWORD waitResult = WaitForSingleObject(pi.hProcess, 30000);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+
+        return (waitResult == WAIT_OBJECT_0);
+    }
+
+    // Run FFmpeg to convert raw fMP4 (init+fragments) to a normal playable MP4: -y -i input -c copy output.
+    static bool runFFmpegConvertToMp4(const std::string& inputPath, const std::string& outputPath)
+    {
+        std::ostringstream cmd;
+        cmd << g_ffmpegPath
+            << " -hide_banner -loglevel error -y"
+            << " -i \"" << inputPath << "\""
+            << " -c copy"
+            << " \"" << outputPath << "\"";
+
+        STARTUPINFOA si = { sizeof(si) };
+        PROCESS_INFORMATION pi{};
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+
+        std::string cmdStr = cmd.str();
+        std::vector<char> cmdLine(cmdStr.begin(), cmdStr.end());
+        cmdLine.push_back('\0');
+
+        BOOL success = CreateProcessA(
+            NULL,
+            cmdLine.data(),
+            NULL,
+            NULL,
+            TRUE,
+            CREATE_NO_WINDOW,
+            NULL,
+            NULL,
+            &si,
+            &pi
+        );
+
+        if (!success)
+            return false;
+
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, 60000);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
@@ -1140,6 +1243,7 @@ private:
         return { value, offset };
     }
 
+    // Parse UMP parts: type (VarInt) + size (VarInt) + payload; mirrors googlevideo UmpReader.read / googlevideo-c UmpReader.
     void consumeUmpParts(UmpAssembler& assem, const std::function<void(const UmpPart&)>& onPart)
     {
         while (true)
@@ -1184,12 +1288,17 @@ private:
         }
     }
 
+    // UMP part handling aligned with googlevideo (googlevideo protos ump_part_id.proto, SabrStream handleMediaHeader/Media/MediaEnd).
     // A single YouTube UMP response contains both audio and video tracks (multiple headerIds / itags).
     // We preserve all tracks: every MEDIA_HEADER and every MEDIA/MEDIA_END is re-emitted so the browser
-    // receives both audio and video. Audio tracks are passed through; video tracks are processed (overlay).
-    void handleUmpPart(UmpAssembler& assem, const UmpPart& part)
+    // receives both audio and video. Init segment is determined by MediaHeader.is_init_seg (primary) or looksLikeInitSegment (fallback).
+    // urlForSaveKey: when non-empty, save state is keyed by URL so all segments for the same video go to one file.
+    void handleUmpPart(UmpAssembler& assem, const UmpPart& part, const std::string& streamKey, const std::string& urlForSaveKey = "")
     {
-        // Part IDs (from YouTube UMP): MEDIA_HEADER=20, MEDIA=21, MEDIA_END=22
+        assem.partCount++;
+        printf("[UMP] part #%zu type=%d size=%d\n", assem.partCount, part.type, part.size);
+
+        // Part IDs: googlevideo UMPPartId MEDIA_HEADER=20, MEDIA=21, MEDIA_END=22 (ump_part_id.proto)
         const int UMP_PART_ID_MEDIA_HEADER = 20;
         const int UMP_PART_ID_MEDIA = 21;
         const int UMP_PART_ID_MEDIA_END = 22;
@@ -1212,9 +1321,12 @@ private:
                     cur.hasIsInitSeg ? (cur.isInitSeg ? "true" : "false") : "?",
                     cur.hasSeq ? std::to_string(cur.sequenceNumber).c_str() : "?");
 
-                // Re-emit the MEDIA_HEADER part into the rewritten UMP stream unchanged.
-                const std::vector<uint8_t> headerBytes = compositeToVector(part.data);
-                umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerBytes);
+                // Re-emit the MEDIA_HEADER part into the rewritten UMP stream unchanged (only when modifying).
+                if (!g_saveOnlyNoModify)
+                {
+                    const std::vector<uint8_t> headerBytes = compositeToVector(part.data);
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerBytes);
+                }
             }
             return;
         }
@@ -1253,54 +1365,57 @@ private:
                 printf("[UMP] Stored init segment for headerId=%u (%zu bytes)\n",
                     (unsigned)headerId, assem.initByHeaderId[headerId].size());
 
-                // If we previously queued fragments waiting for init, replay them now.
-                auto itPending = assem.pendingByHeaderId.find(headerId);
-                if (itPending != assem.pendingByHeaderId.end() && !itPending->second.empty())
+                // If we previously queued fragments waiting for init, replay them now (only when modifying).
+                if (!g_saveOnlyNoModify)
                 {
-                    printf("[UMP] Replaying %zu pending fragment(s) for headerId=%u now that init is available\n",
-                        itPending->second.size(), (unsigned)headerId);
-
-                    // Move pending out to avoid re-entrancy issues.
-                    auto pending = std::move(itPending->second);
-                    assem.pendingByHeaderId.erase(itPending);
-
-                    const bool replayIsAudio = (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag
-                        && isAudioOnlyItag(itMeta->second.itag));
-                    for (auto& frag : pending)
+                    auto itPending = assem.pendingByHeaderId.find(headerId);
+                    if (itPending != assem.pendingByHeaderId.end() && !itPending->second.empty())
                     {
-                        auto itInit2 = assem.initByHeaderId.find(headerId);
-                        if (itInit2 == assem.initByHeaderId.end() || itInit2->second.empty())
-                            break;
+                        printf("[UMP] Replaying %zu pending fragment(s) for headerId=%u now that init is available\n",
+                            itPending->second.size(), (unsigned)headerId);
 
-                        std::vector<uint8_t> mp4;
-                        mp4.reserve(itInit2->second.size() + frag.size());
-                        mp4.insert(mp4.end(), itInit2->second.begin(), itInit2->second.end());
-                        mp4.insert(mp4.end(), frag.begin(), frag.end());
+                        // Move pending out to avoid re-entrancy issues.
+                        auto pending = std::move(itPending->second);
+                        assem.pendingByHeaderId.erase(itPending);
 
-                        std::vector<uint8_t> processedMp4;
-                        if (replayIsAudio)
-                            processedMp4 = mp4;
-                        else if (processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText))
+                        const bool replayIsAudio = (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag
+                            && isAudioOnlyItag(itMeta->second.itag));
+                        for (auto& frag : pending)
                         {
-                            printf("[UMP] Processed replayed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
-                                (unsigned)headerId, mp4.size(), processedMp4.size());
-                        }
-                        else
-                        {
-                            printf("[UMP] FFmpeg library processing failed (replayed) for headerId=%u, falling back to original\n",
-                                (unsigned)headerId);
-                            processedMp4 = std::move(mp4);
-                        }
+                            auto itInit2 = assem.initByHeaderId.find(headerId);
+                            if (itInit2 == assem.initByHeaderId.end() || itInit2->second.empty())
+                                break;
 
-                        // Emit MEDIA + MEDIA_END so the browser receives the replayed segment.
-                        std::vector<uint8_t> mediaData;
-                        mediaData.reserve(1 + processedMp4.size());
-                        mediaData.push_back(headerId);
-                        mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
-                        umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
-                        std::vector<uint8_t> mediaEndData(1);
-                        mediaEndData[0] = headerId;
-                        umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaEndData);
+                            std::vector<uint8_t> mp4;
+                            mp4.reserve(itInit2->second.size() + frag.size());
+                            mp4.insert(mp4.end(), itInit2->second.begin(), itInit2->second.end());
+                            mp4.insert(mp4.end(), frag.begin(), frag.end());
+
+                            std::vector<uint8_t> processedMp4;
+                            if (replayIsAudio)
+                                processedMp4 = mp4;
+                            else if (processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText))
+                            {
+                                printf("[UMP] Processed replayed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
+                                    (unsigned)headerId, mp4.size(), processedMp4.size());
+                            }
+                            else
+                            {
+                                printf("[UMP] FFmpeg library processing failed (replayed) for headerId=%u, falling back to original\n",
+                                    (unsigned)headerId);
+                                processedMp4 = std::move(mp4);
+                            }
+
+                            // Emit MEDIA + MEDIA_END so the browser receives the replayed segment.
+                            std::vector<uint8_t> mediaData;
+                            mediaData.reserve(1 + processedMp4.size());
+                            mediaData.push_back(headerId);
+                            mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
+                            umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+                            std::vector<uint8_t> mediaEndData(1);
+                            mediaEndData[0] = headerId;
+                            umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaEndData);
+                        }
                     }
                 }
                 return;
@@ -1341,6 +1456,94 @@ private:
             std::vector<uint8_t> processedMp4;
             const bool isAudio = (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag
                 && isAudioOnlyItag(itMeta->second.itag));
+
+            // Save incoming video stream: open one file per stream (keyed by normalized URL), write init once, then
+            // APPEND each media segment to the same file (never overwrite). File is opened only once; all later
+            // segment writes explicitly seek to end and append. After g_saveStreamToMp4ForSeconds, close and run FFmpeg.
+            {
+                std::string saveKey = urlForSaveKey.empty() ? streamKey : ("url_" + std::to_string(std::hash<std::string>{}(urlForSaveKey)));
+                if (!isAudio && g_saveStreamToMp4ForSeconds > 0 && !saveKey.empty())
+                {
+                SaveMp4State& save = m_saveMp4[saveKey];
+                if (!save.done)
+                {
+                    const time_t nowSec = time(nullptr);
+                    if (save.startTime == 0)
+                    {
+                        save.startTime = nowSec;
+                        save.videoHeaderId = headerId;
+                        // Short, safe filename: captured_<timestamp>_<hash>.mp4 (hash of URL for stable key)
+                        size_t keyHash = std::hash<std::string>{}(saveKey);
+                        std::string fileName = "captured_" + std::to_string((long long)save.startTime) + "_" + std::to_string(keyHash) + ".mp4";
+
+                        std::string dir;
+                        char pathBuf[MAX_PATH];
+                        if (GetModuleFileNameA(NULL, pathBuf, MAX_PATH))
+                        {
+                            dir = pathBuf;
+                            size_t last = dir.find_last_of("/\\");
+                            if (last != std::string::npos) dir.resize(last + 1);
+                        }
+                        if (dir.empty())
+                        {
+                            if (GetCurrentDirectoryA(MAX_PATH, pathBuf))
+                                dir = pathBuf;
+                            else
+                                dir = ".";  // fallback
+                        }
+                        // Ensure one backslash between dir and subdir/file
+                        if (!dir.empty() && dir.back() != '\\' && dir.back() != '/')
+                            dir += "\\";
+                        std::string captureDir = dir + "captured_streams";
+                        CreateDirectoryA(captureDir.c_str(), 0);
+                        std::string path = captureDir + "\\" + fileName;
+                        if (path.size() >= MAX_PATH)
+                            path = path.substr(0, MAX_PATH - 1);  // avoid overflow
+                        // Open once: create new file (truncate). We never reopen; later writes append.
+                        save.file.open(path, std::ios::binary | std::ios::out);
+                        if (save.file.is_open())
+                        {
+                            save.rawFilePath = path;
+                            printf("[UMP] Saving video stream to %s for %d seconds (segments will be appended)\n", path.c_str(), g_saveStreamToMp4ForSeconds);
+                        }
+                    }
+                    if (save.file.is_open() && save.videoHeaderId == headerId)
+                    {
+                        if (!save.initWritten)
+                        {
+                            save.file.write(reinterpret_cast<const char*>(init->data()), (std::streamsize)init->size());
+                            save.initWritten = true;
+                        }
+                        // Always append this segment to end of file (never overwrite existing data).
+                        save.file.seekp(0, std::ios::end);
+                        save.file.write(reinterpret_cast<const char*>(segment.data()), (std::streamsize)segment.size());
+                        save.file.flush();
+                        if ((nowSec - save.startTime) >= (time_t)g_saveStreamToMp4ForSeconds)
+                        {
+                            save.file.close();
+                            save.done = true;
+                            printf("[UMP] Saved 1 minute of video stream; file closed.\n");
+                            if (!save.rawFilePath.empty())
+                            {
+                                size_t dot = save.rawFilePath.rfind('.');
+                                std::string outPath = (dot != std::string::npos)
+                                    ? (save.rawFilePath.substr(0, dot) + "_ffmpeg.mp4")
+                                    : (save.rawFilePath + "_ffmpeg.mp4");
+                                if (runFFmpegConvertToMp4(save.rawFilePath, outPath))
+                                    printf("[UMP] FFmpeg produced playable file: %s\n", outPath.c_str());
+                                else
+                                    printf("[UMP] FFmpeg conversion failed; raw file kept: %s\n", save.rawFilePath.c_str());
+                            }
+                        }
+                    }
+                }
+                }
+            }
+
+            // In save-only mode we do not modify the stream; we already saved above. Skip FFmpeg and emit.
+            if (g_saveOnlyNoModify)
+                return;
+
             if (isAudio)
             {
                 processedMp4 = mp4;
@@ -1362,10 +1565,8 @@ private:
             }
 
             // Repackage the (possibly processed) MP4 back into UMP MEDIA + MEDIA_END
-            // parts so it can be delivered back to the browser. For simplicity we
-            // emit a single MEDIA part containing the full fragment, followed by a
-            // MEDIA_END containing only the headerId, which matches the example
-            // shape in googlevideo-c/tests/ump_example_test.cpp.
+            // (googlevideo UMPPartId; shape matches googlevideo-c/tests/ump_example_test.cpp).
+            // Emit one MEDIA part (headerId + fragment bytes) then MEDIA_END (headerId only).
             std::vector<uint8_t> mediaData;
             mediaData.reserve(1 + processedMp4.size());
             mediaData.push_back(headerId);
@@ -1407,7 +1608,7 @@ public:
 
         UmpAssembler& assem = m_ump[key];
         assem.buffer.append(bytes);
-        consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part); });
+        consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part, key); });
     }
 
     virtual void tcpClosed(nfapi::ENDPOINT_ID id, nfapi::PNF_TCP_CONN_INFO /*pConnInfo*/)
@@ -1416,6 +1617,19 @@ public:
         m_videoBuffers.erase(id);
         g_http1RequestQueue.erase(id);
         g_http2StreamUrl.erase(id);
+        // Close any save-MP4 file for this connection
+        std::string prefix = std::to_string(id) + ":";
+        for (auto it = m_saveMp4.begin(); it != m_saveMp4.end(); )
+        {
+            if (it->first.size() >= prefix.size() && it->first.compare(0, prefix.size(), prefix) == 0)
+            {
+                if (it->second.file.is_open())
+                    it->second.file.close();
+                it = m_saveMp4.erase(it);
+            }
+            else
+                ++it;
+        }
     }
 
     virtual void tcpConnected(nfapi::ENDPOINT_ID id, nfapi::PNF_TCP_CONN_INFO pConnInfo)
@@ -1566,13 +1780,18 @@ public:
                                     // emitted so we can compute the delta for this chunk.
                                     const size_t prevRewrittenSize = assem.rewrittenUmpOut.size();
 
-                                    consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part); });
+                                    consumeUmpParts(assem, [&](const UmpPart& part) { handleUmpPart(assem, part, k, normalizeUrlForSaveKey(url)); });
+
+                                    // In save-only mode, leave the stream unchanged and ensure position is at start for forwarding.
+                                    if (g_saveOnlyNoModify)
+                                        pStream->seek(0, FILE_BEGIN);
 
                                     // After processing, any new bytes appended to rewrittenUmpOut correspond
                                     // to this chunk of input. Replace the HTTP body with the full rewritten
                                     // stream so far so the browser gets the complete response (reset() clears
                                     // the stream, so we must write the entire body each time).
-                                    if (assem.rewrittenUmpOut.size() > prevRewrittenSize)
+                                    // In save-only mode we do not replace the body; the original stream is passed through.
+                                    if (!g_saveOnlyNoModify && assem.rewrittenUmpOut.size() > prevRewrittenSize)
                                     {
                                         const size_t totalRewritten = assem.rewrittenUmpOut.size();
                                         if (totalRewritten > 0)
@@ -1611,25 +1830,29 @@ public:
                         }
                         else
                         {
-                            // --- Non-UMP path: apply overlay by remuxing with ffmpeg ---
-                            size_t currentSize = (size_t)pStream->size();
-
-                            std::vector<char> videoData(currentSize);
-                            pStream->seek(0, FILE_BEGIN);
-                            pStream->read(videoData.data(), (tStreamSize)currentSize);
-
-                            std::vector<char> processedData;
-                            if (processVideoWithFFmpeg(videoData.data(), videoData.size(), processedData))
+                            // --- Non-UMP path: apply overlay by remuxing with ffmpeg (only when modifying) ---
+                            if (!g_saveOnlyNoModify)
                             {
-                                pStream->reset();
-                                pStream->write(processedData.data(), (tStreamSize)processedData.size());
-                                printf("[dataAvailable] Video processed: %zu -> %zu bytes\n",
-                                    videoData.size(), processedData.size());
+                                size_t currentSize = (size_t)pStream->size();
+
+                                std::vector<char> videoData(currentSize);
+                                pStream->seek(0, FILE_BEGIN);
+                                pStream->read(videoData.data(), (tStreamSize)currentSize);
+
+                                std::vector<char> processedData;
+                                if (processVideoWithFFmpeg(videoData.data(), videoData.size(), processedData))
+                                {
+                                    pStream->reset();
+                                    pStream->write(processedData.data(), (tStreamSize)processedData.size());
+                                    printf("[dataAvailable] Video processed: %zu -> %zu bytes\n",
+                                        videoData.size(), processedData.size());
+                                }
+                                else
+                                {
+                                    printf("[dataAvailable] FFmpeg processing failed\n");
+                                }
                             }
-                            else
-                            {
-                                printf("[dataAvailable] FFmpeg processing failed\n");
-                            }
+                            // When g_saveOnlyNoModify: do not touch non-UMP response; pass through unchanged.
                         }
                     }
                 }
@@ -1665,6 +1888,10 @@ int main(int argc, char* argv[])
 
     printf("Video Overlay Text: %s\n", g_overlayText.c_str());
     printf("FFmpeg Path: %s\n", g_ffmpegPath.c_str());
+    if (g_saveStreamToMp4ForSeconds > 0)
+        printf("Save-to-MP4 enabled: first %d seconds of each video stream will be saved to captured_streams\\*.mp4\n", g_saveStreamToMp4ForSeconds);
+    if (g_saveOnlyNoModify)
+        printf("Dump-only mode: YouTube video stream is saved to file; no response is modified (all pass through unchanged).\n");
     printf("Starting video stream modifier...\n");
 
     // Offline debug mode: parse a dumped UMP file and extract frames into ./ump_output
