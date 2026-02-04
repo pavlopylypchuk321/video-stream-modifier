@@ -35,6 +35,36 @@ void UmpReader::read(const std::function<void(int partNo, int type, int size)>& 
     }
 }
 
+void UmpReader::readWithData(const std::function<void(int partNo, int type, int size, const std::vector<uint8_t>& payload)>& handlePart)
+{
+    static int partNo = 0;
+
+    while (true)
+    {
+        int offset = 0;
+
+        auto [partType, newOffset] = readVarInt(offset);
+        offset = newOffset;
+
+        auto [partSize, finalOffset] = readVarInt(offset);
+        offset = finalOffset;
+
+        if (partType < 0 || partSize < 0)
+            break;
+
+        if (!compositeBuffer.canReadBytes(offset, static_cast<size_t>(partSize)))
+            break;
+
+        auto splitResult = compositeBuffer.split(offset);
+        auto secondSplit = splitResult.second.split(partSize);
+        std::vector<uint8_t> payload = secondSplit.first.toBytes();
+
+        handlePart(++partNo, partType, partSize, payload);
+
+        compositeBuffer = secondSplit.second;
+    }
+}
+
 std::pair<int, int> UmpReader::readVarInt(int offset) const
 {
     int byteLength = 0;

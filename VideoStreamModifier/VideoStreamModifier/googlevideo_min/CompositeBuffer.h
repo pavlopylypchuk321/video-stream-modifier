@@ -25,6 +25,9 @@ namespace GoogleVideoMin
         bool canReadBytes(size_t position, size_t length) const;
         uint8_t getUint8(size_t position) const;
 
+        /** Concatenate all chunks into a single byte vector. */
+        std::vector<uint8_t> toBytes() const;
+
         void focus(size_t position) const;
         bool isFocused(size_t position) const;
 

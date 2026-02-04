@@ -4,12 +4,12 @@
 
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace GoogleVideoMin
 {
     /**
-     * Parses UMP binary stream and invokes callback with part_no, type, and size for each part.
-     * Used by MITM to log UMP metadata without modifying the stream.
+     * Parses UMP binary stream and invokes callback with part_no, type, size, and payload for each part.
      */
     class UmpReader
     {
@@ -18,9 +18,13 @@ namespace GoogleVideoMin
 
         /**
          * Parses parts from the buffer and calls handlePart(partNo, type, size) for each complete part.
-         * Stops when no complete part can be read (returns remaining buffer) or when buffer is exhausted.
          */
         void read(const std::function<void(int partNo, int type, int size)>& handlePart);
+
+        /**
+         * Same as read() but passes part payload bytes to the callback for segment assembly.
+         */
+        void readWithData(const std::function<void(int partNo, int type, int size, const std::vector<uint8_t>& payload)>& handlePart);
 
     private:
         std::pair<int, int> readVarInt(int offset) const;

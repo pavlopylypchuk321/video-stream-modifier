@@ -73,6 +73,15 @@ std::pair<CompositeBuffer, CompositeBuffer> CompositeBuffer::split(size_t positi
 
 size_t CompositeBuffer::getLength() const { return totalLength_; }
 
+std::vector<uint8_t> CompositeBuffer::toBytes() const
+{
+    std::vector<uint8_t> out;
+    out.reserve(totalLength_);
+    for (const auto& c : chunks)
+        out.insert(out.end(), c.begin(), c.end());
+    return out;
+}
+
 bool CompositeBuffer::canReadBytes(size_t position, size_t length) const
 {
     return position + length <= totalLength_;
