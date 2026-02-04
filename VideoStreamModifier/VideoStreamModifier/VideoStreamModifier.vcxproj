@@ -140,6 +140,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="googlevideo_min\CompositeBuffer.cpp" />
+    <ClCompile Include="googlevideo_min\UmpReader.cpp" />
     <ClCompile Include="VideoStreamModifier.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
