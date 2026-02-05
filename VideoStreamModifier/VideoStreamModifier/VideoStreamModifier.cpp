@@ -15,6 +15,7 @@
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <functional>
 #include <cctype>
@@ -198,6 +199,7 @@ private:
         std::unordered_map<uint8_t, std::vector<uint8_t>> curByHeaderId;
         std::unordered_map<uint8_t, std::vector<std::vector<uint8_t>>> pendingByHeaderId;
         std::unordered_map<uint8_t, uint64_t> segIndexByHeaderId;
+        std::unordered_set<uint8_t> initSentForHeaderId;  // Track which header IDs have had their init sent
 
         // Rewritten UMP bytes (we re-emit parts after processing instead of
         // forwarding the original bytes directly).
@@ -1042,120 +1044,44 @@ private:
                 encCtx->color_trc = decCtx->color_trc;
 
             // Configure codec-specific encoder options based on the input codec
-            // while keeping memory usage reasonable.
+            // Use bitrate-based encoding to match the input stream's bitrate
             AVDictionary* opts = nullptr;
             
-            // Try to extract encoding parameters from the input codec context to preserve quality/settings
-            // Note: AVCodecContext doesn't expose private encoder options directly, but we can infer some settings
-            
-            if (enc->id == AV_CODEC_ID_AV1)
+            // Set bitrate from input stream
+            if (decCtx->bit_rate > 0)
             {
-                // For AV1, try to infer quality level from decoder context if available
-                // libaom uses CRF (0-63) for quality; lower = better quality
-                
-                // Check if we can infer quality from the input bitrate and resolution
-                // as a proxy for the original encoding quality
-                int inferredCrf = 32;  // default fallback
-                if (decCtx->bit_rate > 0)
-                {
-                    // Rough heuristic: estimate CRF from bitrate
-                    // Higher bitrate = lower CRF (better quality)
-                    double bitsPerPixelPerSecond = (double)decCtx->bit_rate / (decCtx->width * decCtx->height * 30);  // assume 30fps
-                    if (bitsPerPixelPerSecond > 0.05) inferredCrf = 20;  // high quality
-                    else if (bitsPerPixelPerSecond > 0.02) inferredCrf = 26;
-                    else inferredCrf = 32;  // lower quality for low bitrate
-                }
-                
-                av_dict_set(&opts, "usage", "realtime", 0);   // reduces lag buffers and complexity
-                av_dict_set(&opts, "lag-in-frames", "0", 0);  // avoid allocating large lag buffers
-                av_dict_set(&opts, "crf", std::to_string(inferredCrf).c_str(), 0);  // inferred from input
-                av_dict_set(&opts, "b", "0", 0);              // pure CRF (no bitrate)
-                av_dict_set(&opts, "enable-tpl", "0", 0);     // disable TPL model (saves RAM)
-                av_dict_set(&opts, "row-mt", "1", 0);         // row multi-threading
-                av_dict_set(&opts, "cpu-used", "7", 0);       // faster / lower memory
-
-                // Preserve the original bitrate if available
-                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
-                    encCtx->bit_rate = decCtx->bit_rate;
-                else if (encCtx->bit_rate <= 0)
-                    encCtx->bit_rate = 1500000;                   // ~1.5 Mbps default
-            }
-            else if (enc->id == AV_CODEC_ID_H264)
-            {
-                // H.264 (libx264) encoder options: try to preserve input quality level
-                // CRF range is 0-51, where 23 is default; lower = better quality
-                
-                int inferredCrf = 23;  // default
-                if (decCtx->bit_rate > 0)
-                {
-                    // Infer CRF from bitrate as proxy for original quality
-                    double bitsPerPixelPerSecond = (double)decCtx->bit_rate / (decCtx->width * decCtx->height * 30);
-                    if (bitsPerPixelPerSecond > 0.08) inferredCrf = 18;  // high quality
-                    else if (bitsPerPixelPerSecond > 0.04) inferredCrf = 23;
-                    else inferredCrf = 28;  // lower quality
-                }
-                
-                av_dict_set(&opts, "preset", "fast", 0);      // balance speed and quality
-                av_dict_set(&opts, "crf", std::to_string(inferredCrf).c_str(), 0);  // inferred from input
-                
-                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
-                    encCtx->bit_rate = decCtx->bit_rate;
-                else if (encCtx->bit_rate <= 0)
-                    encCtx->bit_rate = 2500000;                   // ~2.5 Mbps default for H.264
-            }
-            else if (enc->id == AV_CODEC_ID_HEVC)
-            {
-                // H.265/HEVC (libx265) encoder options: try to preserve input quality level
-                // CRF range is 0-51, where 28 is default; lower = better quality
-                
-                int inferredCrf = 28;  // default
-                if (decCtx->bit_rate > 0)
-                {
-                    double bitsPerPixelPerSecond = (double)decCtx->bit_rate / (decCtx->width * decCtx->height * 30);
-                    if (bitsPerPixelPerSecond > 0.06) inferredCrf = 22;  // high quality
-                    else if (bitsPerPixelPerSecond > 0.03) inferredCrf = 28;
-                    else inferredCrf = 35;  // lower quality
-                }
-                
-                av_dict_set(&opts, "preset", "fast", 0);      // balance speed and quality
-                av_dict_set(&opts, "crf", std::to_string(inferredCrf).c_str(), 0);  // inferred from input
-                
-                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
-                    encCtx->bit_rate = decCtx->bit_rate;
-                else if (encCtx->bit_rate <= 0)
-                    encCtx->bit_rate = 1500000;                   // ~1.5 Mbps default for HEVC
-            }
-            else if (enc->id == AV_CODEC_ID_VP9)
-            {
-                // VP9 encoder options: VP9 uses 0-63 quality scale
-                int inferredQuality = 40;  // default (lower quality)
-                if (decCtx->bit_rate > 0)
-                {
-                    double bitsPerPixelPerSecond = (double)decCtx->bit_rate / (decCtx->width * decCtx->height * 30);
-                    if (bitsPerPixelPerSecond > 0.08) inferredQuality = 20;  // high quality
-                    else if (bitsPerPixelPerSecond > 0.04) inferredQuality = 35;
-                    else inferredQuality = 45;  // lower quality
-                }
-                
-                av_dict_set(&opts, "deadline", "good", 0);    // quality mode (realtime, good, best)
-                av_dict_set(&opts, "cpu-used", "5", 0);       // complexity (0-8, higher=faster)
-                av_dict_set(&opts, "quality", std::to_string(inferredQuality).c_str(), 0);  // inferred from input
-                
-                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
-                    encCtx->bit_rate = decCtx->bit_rate;
-                else if (encCtx->bit_rate <= 0)
-                    encCtx->bit_rate = 2000000;                   // ~2 Mbps default for VP9
+                encCtx->bit_rate = decCtx->bit_rate;
             }
             else
             {
-                // Generic fallback: preserve bitrate and use reasonable quality
-                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
-                    encCtx->bit_rate = decCtx->bit_rate;
-                else if (encCtx->bit_rate <= 0)
-                    encCtx->bit_rate = 2500000;                   // ~2.5 Mbps default
+                // Fallback default bitrate
+                encCtx->bit_rate = 2500000;  // ~2.5 Mbps default
+            }
+            
+            // Codec-specific options
+            if (enc->id == AV_CODEC_ID_AV1)
+            {
+                av_dict_set(&opts, "usage", "realtime", 0);
+                av_dict_set(&opts, "lag-in-frames", "0", 0);
+                av_dict_set(&opts, "enable-tpl", "0", 0);
+                av_dict_set(&opts, "row-mt", "1", 0);
+                av_dict_set(&opts, "cpu-used", "7", 0);
+            }
+            else if (enc->id == AV_CODEC_ID_H264)
+            {
+                av_dict_set(&opts, "preset", "fast", 0);
+            }
+            else if (enc->id == AV_CODEC_ID_HEVC)
+            {
+                av_dict_set(&opts, "preset", "fast", 0);
+            }
+            else if (enc->id == AV_CODEC_ID_VP9)
+            {
+                av_dict_set(&opts, "deadline", "good", 0);
+                av_dict_set(&opts, "cpu-used", "5", 0);
             }
             av_dict_set(&opts, "movflags",
-                "frag_keyframe+empty_moov+default_base_moof", 0);
+                "faststart+default_base_moof", 0);
 
             // Set MP4 muxer options to preserve the original container format (dash, isom, etc.)
             // The major_brand and compatible_brands control the ftyp box which is critical for compatibility
@@ -1802,12 +1728,59 @@ private:
             }
             // Repackage the (possibly processed) MP4 back into UMP MEDIA + MEDIA_END
             // (googlevideo UMPPartId; shape matches googlevideo-c/tests/ump_example_test.cpp).
-            // Emit one MEDIA part (headerId + fragment bytes) then MEDIA_END (headerId only).
-            std::vector<uint8_t> mediaData;
-            mediaData.reserve(1 + processedMp4.size());
-            mediaData.push_back(headerId);
-            mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
-            umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+            // Send init segment only once per header ID, then send only fragments
+            
+            // Check if we've already sent init for this header ID
+            bool shouldSendInit = (assem.initSentForHeaderId.find(headerId) == assem.initSentForHeaderId.end());
+            
+            if (shouldSendInit)
+            {
+                // First segment: send init via MEDIA_HEADER (already emitted above)
+                // Now send the full MP4 (init + fragment) as the first media segment
+                std::vector<uint8_t> mediaData;
+                mediaData.reserve(1 + processedMp4.size());
+                mediaData.push_back(headerId);
+                mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
+                umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+                
+                // Mark init as sent for this header
+                assem.initSentForHeaderId.insert(headerId);
+            }
+            else
+            {
+                // Subsequent segments: send only the fragment (skip init boxes)
+                // Extract just moof+mdat from the fMP4
+                std::vector<uint8_t> fragmentOnly;
+                if (processedMp4.size() >= 8)
+                {
+                    size_t pos = 0;
+                    while (pos + 8 <= processedMp4.size())
+                    {
+                        uint32_t boxSize = (uint32_t)processedMp4[pos] << 24 | (uint32_t)processedMp4[pos+1] << 16 
+                                         | (uint32_t)processedMp4[pos+2] << 8 | (uint32_t)processedMp4[pos+3];
+                        char boxType[4] = { (char)processedMp4[pos+4], (char)processedMp4[pos+5], (char)processedMp4[pos+6], (char)processedMp4[pos+7] };
+
+                        if (boxSize == 0 || pos + boxSize > processedMp4.size())
+                            break;
+
+                        // Skip init boxes (ftyp, moov), keep media fragments (moof, mdat)
+                        if ((boxType[0] == 'm' && boxType[1] == 'o' && boxType[2] == 'o' && boxType[3] == 'f') ||
+                            (boxType[0] == 'm' && boxType[1] == 'd' && boxType[2] == 'a' && boxType[3] == 't'))
+                        {
+                            fragmentOnly.insert(fragmentOnly.end(), processedMp4.begin() + pos, processedMp4.begin() + pos + boxSize);
+                        }
+
+                        pos += boxSize;
+                    }
+                }
+                
+                // Send fragment only
+                std::vector<uint8_t> mediaData;
+                mediaData.reserve(1 + fragmentOnly.size());
+                mediaData.push_back(headerId);
+                mediaData.insert(mediaData.end(), fragmentOnly.begin(), fragmentOnly.end());
+                umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+            }
 
             std::vector<uint8_t> mediaEndData(1);
             mediaEndData[0] = headerId;
