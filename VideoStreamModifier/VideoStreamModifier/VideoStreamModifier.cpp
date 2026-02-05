@@ -210,6 +210,10 @@ private:
         size_t partCount = 0;
     };
 
+    // Number of UMP parts written globally (across all streams) for continuous sequence numbering
+    // in the MediaSource API output stream.
+    size_t partWriteCount = 0;
+
     // Map of UMP assemblers keyed by stream (connection:id:streamId:url). One assembler per stream
     // so init segment and itag headerId state are correctly shared across HTTP responses.
     std::map<std::string, UmpAssembler> m_umpAssemblers;
@@ -1495,7 +1499,6 @@ private:
     void handleUmpPart(UmpAssembler& assem, const UmpPart& part, const std::string& streamKey, const std::string& urlForSaveKey = "")
     {
         assem.partCount++;
-        printf("[UMP] part #%zu type=%d size=%d\n", assem.partCount, part.type, part.size);
 
         // Part IDs: googlevideo UMPPartId MEDIA_HEADER=20, MEDIA=21, MEDIA_END=22 (ump_part_id.proto)
         const int UMP_PART_ID_MEDIA_HEADER = 20;
@@ -1514,18 +1517,8 @@ private:
                 if (meta.hasItag) { cur.hasItag = true; cur.itag = meta.itag; }
                 if (meta.hasSeq) { cur.hasSeq = true; cur.sequenceNumber = meta.sequenceNumber; }
 
-                printf("[UMP] MediaHeader headerId=%u itag=%s is_init_seg=%s seq=%s\n",
-                    (unsigned)hdr,
-                    cur.hasItag ? std::to_string(cur.itag).c_str() : "?",
-                    cur.hasIsInitSeg ? (cur.isInitSeg ? "true" : "false") : "?",
-                    cur.hasSeq ? std::to_string(cur.sequenceNumber).c_str() : "?");
-
-                // Re-emit the MEDIA_HEADER part into the rewritten UMP stream unchanged (only when modifying).
-                if (!g_saveOnlyNoModify)
-                {
-                    const std::vector<uint8_t> headerBytes = compositeToVector(part.data);
-                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerBytes);
-                }
+                // Incoming MEDIA_HEADER - extract metadata only, don't forward
+                // The MEDIA_HEADER will be re-emitted after processing the segment with is_init_seg flag
             }
             return;
         }
@@ -1535,8 +1528,7 @@ private:
             auto split = part.data.split(1);
             auto& cur = assem.curByHeaderId[headerId];
             appendCompositeToVector(split.second, cur);
-            printf("[UMP] Received media segment for headerId=%u (%zu bytes)\n",
-                (unsigned)headerId, part.size);
+            // Incoming MEDIA segment - accumulating bytes
         }
         else if (part.type == UMP_PART_ID_MEDIA_END)
         {
@@ -1544,7 +1536,7 @@ private:
             auto it = assem.curByHeaderId.find(headerId);
             if (it == assem.curByHeaderId.end())
             {
-                printf("[UMP] No media segment found for headerId=%u\n", (unsigned)headerId);
+                // No media segment found for this header ID
                 return;
             }
 
@@ -1553,7 +1545,7 @@ private:
 
             if (segment.empty())
             {
-                printf("[UMP] Media segment is empty for headerId=%u\n", (unsigned)headerId);
+                // Media segment is empty for this header ID
                 return;
             }
 
@@ -1571,14 +1563,12 @@ private:
                     assem.initByItag[itag] = std::move(segment);
                     // Clear any headerId-keyed init to avoid ambiguity.
                     assem.initByHeaderId.erase(headerId);
-                    printf("[UMP] Stored init segment for itag=%d (headerId=%u) (%zu bytes)\n",
-                        itag, (unsigned)headerId, assem.initByItag[itag].size());
+                    // Init segment stored for itag
                 }
                 else
                 {
                     assem.initByHeaderId[headerId] = std::move(segment);
-                    printf("[UMP] Stored init segment for headerId=%u (%zu bytes)\n",
-                        (unsigned)headerId, assem.initByHeaderId[headerId].size());
+                    // Init segment stored for header ID
                 }
 
                 // If we previously queued fragments waiting for init, replay them now (only when modifying).
@@ -1587,8 +1577,7 @@ private:
                     auto itPending = assem.pendingByHeaderId.find(headerId);
                     if (itPending != assem.pendingByHeaderId.end() && !itPending->second.empty())
                     {
-                        printf("[UMP] Replaying %zu pending fragment(s) for headerId=%u now that init is available\n",
-                            itPending->second.size(), (unsigned)headerId);
+                        // Replaying pending fragments now that init is available
 
                         // Move pending out to avoid re-entrancy issues.
                         auto pending = std::move(itPending->second);
@@ -1626,25 +1615,51 @@ private:
                                 processedMp4 = mp4;
                             else if (processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText))
                             {
-                                printf("[UMP] Processed replayed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
-                                    (unsigned)headerId, mp4.size(), processedMp4.size());
+                                // Processed replayed segment
                             }
                             else
                             {
-                                printf("[UMP] FFmpeg library processing failed (replayed) for headerId=%u, falling back to original\n",
-                                    (unsigned)headerId);
+                                // FFmpeg processing failed, using original
                                 processedMp4 = std::move(mp4);
                             }
 
-                            // Emit MEDIA + MEDIA_END so the browser receives the replayed segment.
+                            // Emit MEDIA_HEADER + MEDIA + MEDIA_END so the browser receives the replayed segment.
+                            // First, send MEDIA_HEADER for this fragment
+                            {
+                                std::vector<uint8_t> headerData;
+                                // Encode header_id (field 1, wire type 0 = varint)
+                                headerData.push_back((1 << 3) | 0);
+                                headerData.push_back(headerId);
+                                // Encode itag (field 3, wire type 0 = varint) if available
+                                if (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag)
+                                {
+                                    headerData.push_back((3 << 3) | 0);
+                                    uint32_t itag = itMeta->second.itag;
+                                    if (itag < 128) {
+                                        headerData.push_back(itag);
+                                    } else {
+                                        headerData.push_back((itag & 0x7F) | 0x80);
+                                        headerData.push_back(itag >> 7);
+                                    }
+                                }
+                                // is_init_seg=false for replayed fragments
+                                umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerData);
+                                printf("[UMP-OUT] #%zu part MEDIA_HEADER: headerId=%u itag=%d is_init_seg=false (%zu bytes)\n",
+                                    ++partWriteCount, (unsigned)headerId, itMeta->second.hasItag ? itMeta->second.itag : -1, headerData.size());
+                            }
+                            
                             std::vector<uint8_t> mediaData;
                             mediaData.reserve(1 + processedMp4.size());
                             mediaData.push_back(headerId);
                             mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
                             umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+                            printf("[UMP-OUT] #%zu part MEDIA: headerId=%u (replayed fragment) (%zu bytes)\n",
+                                ++partWriteCount, (unsigned)headerId, processedMp4.size());
+                            
                             std::vector<uint8_t> mediaEndData(1);
                             mediaEndData[0] = headerId;
                             umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaEndData);
+                            printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
                         }
                     }
                 }
@@ -1675,8 +1690,7 @@ private:
                 if (q.size() < 6) // simple cap to avoid unbounded memory growth
                     q.push_back(std::move(segment));
 
-                printf("[UMP] No init segment yet for headerId=%u, queued media fragment (%zu bytes). pending=%zu\n",
-                    (unsigned)headerId, segSize, q.size());
+                // No init segment yet, queueing fragment
                 return;
             }
 
@@ -1697,60 +1711,70 @@ private:
             if (g_saveOnlyNoModify)
                 return;
 
-            if (isAudio)
-            {
-                processedMp4 = mp4;
-            }
-            else
-            {
-                bool processedOk = processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText);
-                if (processedOk)
-                {
-                    printf("[UMP] Processed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
-                        (unsigned)headerId, mp4.size(), processedMp4.size());
-                }
-                else
-                {
-                    printf("[UMP] FFmpeg library processing failed for headerId=%u, falling back to original bytes\n",
-                        (unsigned)headerId);
-                    processedMp4 = std::move(mp4);
-                }
-            }
-            //
-            {
-                std::string saveKey = urlForSaveKey.empty() ? streamKey : ("url_" + std::to_string(std::hash<std::string>{}(urlForSaveKey)));
-                saveOneSegmentToFile(saveKey, init, mp4, isAudio, headerId, true);
-            }
-            // Save each segment as a separate file (init + modified segment per file; init reused from state when missing).
-            {
-                std::string saveKey = urlForSaveKey.empty() ? streamKey : ("url_" + std::to_string(std::hash<std::string>{}(urlForSaveKey)));
-                saveOneSegmentToFile(saveKey, init, processedMp4, isAudio, headerId, false);
-            }
-            // Repackage the (possibly processed) MP4 back into UMP MEDIA + MEDIA_END
-            // (googlevideo UMPPartId; shape matches googlevideo-c/tests/ump_example_test.cpp).
-            // Send init segment only once per header ID, then send only fragments
+             if (isAudio)
+             {
+                 processedMp4 = mp4;
+             }
+             else
+             {
+                 bool processedOk = processMp4WithFfmpegLibs(mp4, processedMp4, g_overlayText);
+                 if (processedOk)
+                 {
+                     printf("[UMP] Processed UMP segment for headerId=%u (%zu -> %zu bytes)\n",
+                         (unsigned)headerId, mp4.size(), processedMp4.size());
+                 }
+                 else
+                 {
+                     printf("[UMP] FFmpeg library processing failed for headerId=%u, falling back to original bytes\n",
+                         (unsigned)headerId);
+                     processedMp4 = std::move(mp4);
+                 }
+             }
             
-            // Check if we've already sent init for this header ID
+            //processedMp4 = mp4;
+            // Repackage the original YouTube MP4 back into UMP MEDIA + MEDIA_END with proper init-only separation.
+            // The incoming 'segment' already has init+fragment combined from YouTube.
+            // We split them: first time send init-only, subsequent times send fragment-only.
+            
             bool shouldSendInit = (assem.initSentForHeaderId.find(headerId) == assem.initSentForHeaderId.end());
             
             if (shouldSendInit)
             {
-                // First segment: send init via MEDIA_HEADER (already emitted above)
-                // Now send the full MP4 (init + fragment) as the first media segment
-                std::vector<uint8_t> mediaData;
-                mediaData.reserve(1 + processedMp4.size());
-                mediaData.push_back(headerId);
-                mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
-                umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+                // First segment: need to send MEDIA_HEADER first, then split and send init/fragment separately
                 
-                // Mark init as sent for this header
-                assem.initSentForHeaderId.insert(headerId);
-            }
-            else
-            {
-                // Subsequent segments: send only the fragment (skip init boxes)
-                // Extract just moof+mdat from the fMP4
-                std::vector<uint8_t> fragmentOnly;
+                // Re-emit MEDIA_HEADER with codec info for the new init segment
+                if (itMeta != assem.metaByHeaderId.end())
+                {
+                    // Reconstruct MEDIA_HEADER from metadata
+                    std::vector<uint8_t> headerData;
+                    // Encode header_id (field 1, wire type 0 = varint)
+                    headerData.push_back((1 << 3) | 0);
+                    headerData.push_back(headerId);
+                    // Encode itag (field 3, wire type 0 = varint) if available
+                    if (itMeta->second.hasItag)
+                    {
+                        headerData.push_back((3 << 3) | 0);
+                        uint32_t itag = itMeta->second.itag;
+                        if (itag < 128) {
+                            headerData.push_back(itag);
+                        } else {
+                            headerData.push_back((itag & 0x7F) | 0x80);
+                            headerData.push_back(itag >> 7);
+                        }
+                    }
+                    // Encode is_init_seg (field 8, wire type 0 = varint) = 1 for init
+                    headerData.push_back((8 << 3) | 0);
+                    headerData.push_back(1);
+                    
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerData);
+                    printf("[UMP-OUT] #%zu part MEDIA_HEADER: headerId=%u itag=%d is_init_seg=true (%zu bytes)\n",
+                        ++partWriteCount, (unsigned)headerId, itMeta->second.hasItag ? itMeta->second.itag : -1, headerData.size());
+                }
+                
+                // Split init boxes (ftyp/moov) from fragment boxes (styp/moof/mdat)
+                std::vector<uint8_t> initBoxes;
+                std::vector<uint8_t> fragmentBoxes;
+                
                 if (processedMp4.size() >= 8)
                 {
                     size_t pos = 0;
@@ -1758,33 +1782,164 @@ private:
                     {
                         uint32_t boxSize = (uint32_t)processedMp4[pos] << 24 | (uint32_t)processedMp4[pos+1] << 16 
                                          | (uint32_t)processedMp4[pos+2] << 8 | (uint32_t)processedMp4[pos+3];
-                        char boxType[4] = { (char)processedMp4[pos+4], (char)processedMp4[pos+5], (char)processedMp4[pos+6], (char)processedMp4[pos+7] };
-
+                        
                         if (boxSize == 0 || pos + boxSize > processedMp4.size())
                             break;
 
-                        // Skip init boxes (ftyp, moov), keep media fragments (moof, mdat)
-                        if ((boxType[0] == 'm' && boxType[1] == 'o' && boxType[2] == 'o' && boxType[3] == 'f') ||
-                            (boxType[0] == 'm' && boxType[1] == 'd' && boxType[2] == 'a' && boxType[3] == 't'))
+                        char boxType0 = (char)processedMp4[pos+4];
+                        char boxType1 = (char)processedMp4[pos+5];
+                        char boxType2 = (char)processedMp4[pos+6];
+                        char boxType3 = (char)processedMp4[pos+7];
+
+                        // Init boxes: ftyp, moov
+                        if ((boxType0 == 'f' && boxType1 == 't' && boxType2 == 'y' && boxType3 == 'p') ||
+                            (boxType0 == 'm' && boxType1 == 'o' && boxType2 == 'o' && boxType3 == 'v'))
                         {
-                            fragmentOnly.insert(fragmentOnly.end(), processedMp4.begin() + pos, processedMp4.begin() + pos + boxSize);
+                            initBoxes.insert(initBoxes.end(), processedMp4.begin() + pos, processedMp4.begin() + pos + boxSize);
+                        }
+                        else
+                        {
+                            // Fragment boxes: styp, moof, mdat, etc.
+                            fragmentBoxes.insert(fragmentBoxes.end(), processedMp4.begin() + pos, processedMp4.begin() + pos + boxSize);
                         }
 
                         pos += boxSize;
                     }
                 }
                 
-                // Send fragment only
-                std::vector<uint8_t> mediaData;
-                mediaData.reserve(1 + fragmentOnly.size());
-                mediaData.push_back(headerId);
-                mediaData.insert(mediaData.end(), fragmentOnly.begin(), fragmentOnly.end());
-                umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+                // Send init boxes alone as MEDIA + MEDIA_END
+                if (!initBoxes.empty())
+                {
+                    std::vector<uint8_t> mediaInitData;
+                    mediaInitData.push_back(headerId);
+                    mediaInitData.insert(mediaInitData.end(), initBoxes.begin(), initBoxes.end());
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaInitData);
+                    printf("[UMP-OUT] #%zu part MEDIA: headerId=%u (init-only: ftyp/moov) (%zu bytes)\n",
+                        ++partWriteCount, (unsigned)headerId, initBoxes.size());
+                    
+                    std::vector<uint8_t> mediaInitEndData(1);
+                    mediaInitEndData[0] = headerId;
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaInitEndData);
+                    printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
+                }
+                
+                // If fragment boxes exist, send them as separate MEDIA + MEDIA_END
+                if (!fragmentBoxes.empty())
+                {
+                    std::vector<uint8_t> mediaFragData;
+                    mediaFragData.push_back(headerId);
+                    mediaFragData.insert(mediaFragData.end(), fragmentBoxes.begin(), fragmentBoxes.end());
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaFragData);
+                    printf("[UMP-OUT] #%zu part MEDIA: headerId=%u (fragment: styp/moof/mdat) (%zu bytes)\n",
+                        ++partWriteCount, (unsigned)headerId, fragmentBoxes.size());
+                    
+                    std::vector<uint8_t> mediaFragEndData(1);
+                    mediaFragEndData[0] = headerId;
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaFragEndData);
+                    printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
+                }
+                
+                // Mark init as sent
+                assem.initSentForHeaderId.insert(headerId);
+                printf("[UMP-OUT] Init marked as sent for headerId=%u\n", (unsigned)headerId);
             }
+            else
+            {
+                // Subsequent segments: extract and send only fragment boxes (skip ftyp/moov)
+                std::vector<uint8_t> initBoxes;
+                std::vector<uint8_t> fragmentBoxes;
+                
+                if (processedMp4.size() >= 8)
+                {
+                    size_t pos = 0;
+                    while (pos + 8 <= processedMp4.size())
+                    {
+                        uint32_t boxSize = (uint32_t)processedMp4[pos] << 24 | (uint32_t)processedMp4[pos+1] << 16 
+                                         | (uint32_t)processedMp4[pos+2] << 8 | (uint32_t)processedMp4[pos+3];
+                        
+                        if (boxSize == 0 || pos + boxSize > processedMp4.size())
+                            break;
 
-            std::vector<uint8_t> mediaEndData(1);
-            mediaEndData[0] = headerId;
-            umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaEndData);
+                        char boxType0 = (char)processedMp4[pos+4];
+                        char boxType1 = (char)processedMp4[pos+5];
+                        char boxType2 = (char)processedMp4[pos+6];
+                        char boxType3 = (char)processedMp4[pos+7];
+
+                        // Init boxes: ftyp, moov
+                        if ((boxType0 == 'f' && boxType1 == 't' && boxType2 == 'y' && boxType3 == 'p') ||
+                            (boxType0 == 'm' && boxType1 == 'o' && boxType2 == 'o' && boxType3 == 'v'))
+                        {
+                            initBoxes.insert(initBoxes.end(), processedMp4.begin() + pos, processedMp4.begin() + pos + boxSize);
+                        }
+                        else
+                        {
+                            // Keep fragment boxes: styp, moof, mdat
+                            fragmentBoxes.insert(fragmentBoxes.end(), processedMp4.begin() + pos, processedMp4.begin() + pos + boxSize);
+                        }
+
+                        pos += boxSize;
+                    }
+                }
+                
+                // Send MEDIA_HEADER for subsequent segments (is_init_seg=false)
+                // This tells the browser which codec stream this fragment belongs to
+                {
+                    std::vector<uint8_t> headerData;
+                    // Varint encode the header ID
+                    headerData.push_back(headerId);
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerData);
+                    auto itMeta = assem.metaByHeaderId.find(headerId);
+                    printf("[UMP-OUT] #%zu part MEDIA_HEADER: headerId=%u itag=%d is_init_seg=false (%zu bytes)\n",
+                        ++partWriteCount, (unsigned)headerId, itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag ? itMeta->second.itag : -1, headerData.size());
+                }
+                
+                // For audio: if no fragment boxes but init boxes exist, send the init boxes as media
+                // (audio init segments don't have separate fragment boxes)
+                if (fragmentBoxes.empty() && !initBoxes.empty() && isAudio)
+                {
+                    std::vector<uint8_t> mediaInitData;
+                    mediaInitData.push_back(headerId);
+                    mediaInitData.insert(mediaInitData.end(), initBoxes.begin(), initBoxes.end());
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaInitData);
+                    printf("[UMP-OUT] #%zu part MEDIA: headerId=%u (audio: ftyp/moov as data) (%zu bytes)\n",
+                        ++partWriteCount, (unsigned)headerId, initBoxes.size());
+                    
+                    std::vector<uint8_t> mediaInitEndData(1);
+                    mediaInitEndData[0] = headerId;
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaInitEndData);
+                    printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
+                }
+                // For video or audio with fragments: send fragment boxes as normal
+                else if (!fragmentBoxes.empty())
+                {
+                    std::vector<uint8_t> mediaFragData;
+                    mediaFragData.push_back(headerId);
+                    mediaFragData.insert(mediaFragData.end(), fragmentBoxes.begin(), fragmentBoxes.end());
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaFragData);
+                    printf("[UMP-OUT] #%zu part MEDIA: headerId=%u (fragment: styp/moof/mdat) (%zu bytes)\n",
+                        ++partWriteCount, (unsigned)headerId, fragmentBoxes.size());
+                    
+                    std::vector<uint8_t> mediaFragEndData(1);
+                    mediaFragEndData[0] = headerId;
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaFragEndData);
+                    printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
+                }
+                // Fallback: no recognized boxes, send everything as-is
+                else if (!processedMp4.empty())
+                {
+                    std::vector<uint8_t> mediaData;
+                    mediaData.push_back(headerId);
+                    mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
+                    printf("[UMP-OUT] #%zu part MEDIA: headerId=%u (fallback: all bytes) (%zu bytes)\n",
+                        ++partWriteCount, (unsigned)headerId, processedMp4.size());
+                    
+                    std::vector<uint8_t> mediaEndData(1);
+                    mediaEndData[0] = headerId;
+                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaEndData);
+                    printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
+                }
+            }
         }
     }
 
@@ -1967,7 +2122,6 @@ public:
                             }
                             else
                             {
-                                printf("[dataAvailable] UMP entry: %s\n", url.c_str());
                                 // One dataAvailable call per HTTP response: read full body and handle.
                                 const size_t currentSize = (size_t)pStream->size();
                                 std::vector<uint8_t> fullBody(currentSize);
