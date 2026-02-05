@@ -63,7 +63,7 @@ static int g_saveStreamToMp4ForSeconds = 100;
 
 // When true: only dump YouTube video stream to file; no response is ever modified (all responses pass through unchanged).
 // When false: apply overlay and rewrite response bodies (original behavior).
-static bool g_saveOnlyNoModify = true;
+static bool g_saveOnlyNoModify = false;
 
 // #region agent log
 static const char* g_agent_log_path = "d:/RCAL/workspace/Video_Streaming/.cursor/debug.log";
@@ -222,9 +222,9 @@ private:
     };
     std::map<std::string, SaveMp4State> m_saveMp4;
 
-    // Write one segment to a new file: captured_streams/captured_<time>_<hash>_seg_<N>.mp4 (init + segment).
+    // Write one segment to a new file: captured_streams/captured_<time>_<hash>_seg_<N>.mp4 (init + processed segment).
     void saveOneSegmentToFile(const std::string& saveKey, const std::vector<uint8_t>* init,
-        const std::vector<uint8_t>& segment, bool isAudio, uint8_t headerId)
+        const std::vector<uint8_t>& processedSegment, bool isAudio, uint8_t headerId, bool original = false)
     {
         if (isAudio || g_saveStreamToMp4ForSeconds <= 0 || saveKey.empty() || !init || init->empty()){
             printf("[UMP] Skipping save for audio or invalid init/saveKey: isAudio=%s, g_saveStreamToMp4ForSeconds=%d, saveKey='%s', init=%p, init->empty()=%s\n",
@@ -266,21 +266,25 @@ private:
         std::string captureDir = dir + "captured_streams";
         CreateDirectoryA(captureDir.c_str(), 0);
         size_t keyHash = std::hash<std::string>{}(saveKey);
+
         std::string fileName = "captured_" + std::to_string((long long)save.startTime)
-            + "_" + std::to_string(keyHash) + "_seg_" + std::to_string(save.segmentCount) + ".mp4";
+            + "_" + std::to_string(keyHash) + "_seg_" + std::to_string(save.segmentCount);
+        if(original)
+            fileName += "_orig.mp4";
+        else
+            fileName += "_mod.mp4";
         std::string path = captureDir + "\\" + fileName;
         if (path.size() >= MAX_PATH)
             path = path.substr(0, MAX_PATH - 1);
         std::ofstream out(path, std::ios::binary | std::ios::out);
         if (out.is_open())
         {
-            out.write(reinterpret_cast<const char*>(init->data()), (std::streamsize)init->size());
-            out.write(reinterpret_cast<const char*>(segment.data()), (std::streamsize)segment.size());
+            out.write(reinterpret_cast<const char*>(processedSegment.data()), (std::streamsize)processedSegment.size());
             out.close();
             save.segmentCount++;
-            printf("[UMP] Saved segment %llu to %s\n", (unsigned long long)save.segmentCount, path.c_str());
+            printf("[UMP] Saved segment %llu (modified UMP) to %s\n", (unsigned long long)save.segmentCount, path.c_str());
             if (save.segmentCount == 1)
-                printf("[UMP] Saving each segment as separate file to %s (init reused when missing)\n", captureDir.c_str());
+                printf("[UMP] Saving each modified UMP segment as separate file to %s (init reused when missing)\n", captureDir.c_str());
         }
     }
 
@@ -893,7 +897,8 @@ private:
         bool outputHeaderWritten = false;  // only call av_write_trailer if this is true
         MemBuffer mb{ inMp4.data(), inMp4.size(), 0 };
         OutBuffer ob{ &outMp4 };
-
+        const char* demuxer = ifmtCtx->iformat->name;
+        const char* out_fmt = nullptr;
         // ---------- Input: custom AVIO over in-memory MP4 ----------
         const int avioBufSize = 64 * 1024;
         inAvioBuf = static_cast<uint8_t*>(av_malloc(avioBufSize));
@@ -948,7 +953,22 @@ private:
         }
 
         // ---------- Output: custom AVIO that writes into outMp4 ----------
-        if (avformat_alloc_output_context2(&ofmtCtx, nullptr, "mp4", nullptr) < 0 || !ofmtCtx)
+
+        if (!strcmp(demuxer, "mov,mp4,m4a,3gp,3g2,mj2")) {
+            out_fmt = "mp4";
+        }
+        else if (!strcmp(demuxer, "webm")) {
+            out_fmt = "webm";
+        }
+        else if (!strcmp(demuxer, "matroska,webm")) {
+            out_fmt = "matroska";
+        }
+        else {
+            // fallback
+            out_fmt = demuxer;
+        }
+        // Use the same format as the input to preserve container properties
+        if (avformat_alloc_output_context2(&ofmtCtx, nullptr, out_fmt, nullptr) < 0 || !ofmtCtx)
             goto cleanup;
 
         {
@@ -996,36 +1016,144 @@ private:
                 encCtx->framerate = AVRational{ 30, 1 };
             }
 
+            // Preserve bitrate/quality settings from the input stream when available.
+            if (decCtx->bit_rate > 0)
+            {
+                encCtx->bit_rate = decCtx->bit_rate;
+            }
+
             if (ofmtCtx->oformat->flags & AVFMT_GLOBALHEADER)
                 encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-            // Configure encoder options, especially for AV1/libaom, to avoid
-            // excessive memory usage and make rate control explicit.
+            // Preserve additional properties from the input codec context
+            // to match the original encoding settings as closely as possible.
+            if (decCtx->color_range != AVCOL_RANGE_UNSPECIFIED)
+                encCtx->color_range = decCtx->color_range;
+            if (decCtx->colorspace != AVCOL_SPC_UNSPECIFIED)
+                encCtx->colorspace = decCtx->colorspace;
+            if (decCtx->color_primaries != AVCOL_PRI_UNSPECIFIED)
+                encCtx->color_primaries = decCtx->color_primaries;
+            if (decCtx->color_trc != AVCOL_TRC_UNSPECIFIED)
+                encCtx->color_trc = decCtx->color_trc;
+
+            // Configure codec-specific encoder options based on the input codec
+            // while keeping memory usage reasonable.
+            AVDictionary* opts = nullptr;
+            
+            // Try to extract encoding parameters from the input codec context to preserve quality/settings
+            // Note: AVCodecContext doesn't expose private encoder options directly, but we can infer some settings
+            
+            if (enc->id == AV_CODEC_ID_AV1)
             {
-                AVDictionary* opts = nullptr;
-
-                if (enc->id == AV_CODEC_ID_AV1)
+                // For AV1, try to infer quality level from decoder context if available
+                // libaom uses CRF (0-63) for quality; lower = better quality
+                
+                // Check if we can infer quality from the input bitrate and resolution
+                // as a proxy for the original encoding quality
+                int inferredCrf = 32;  // default fallback
+                if (decCtx->bit_rate > 0)
                 {
-                    // Use a constrained quality mode with an explicit CRF and
-                    // disable some heavy features that can blow up memory usage.
-                    av_dict_set(&opts, "usage", "realtime", 0);   // reduces lag buffers and complexity
-                    av_dict_set(&opts, "lag-in-frames", "0", 0);  // avoid allocating large lag buffers
-                    av_dict_set(&opts, "crf", "32", 0);           // explicit CRF
-                    av_dict_set(&opts, "b", "0", 0);              // pure CRF (no bitrate)
-                    av_dict_set(&opts, "enable-tpl", "0", 0);     // disable TPL model (saves RAM)
-                    av_dict_set(&opts, "row-mt", "1", 0);         // row multi-threading
-                    av_dict_set(&opts, "cpu-used", "7", 0);       // faster / lower memory
-
-                    // Also give FFmpeg's generic RC fields a sane default bitrate
-                    // so libaom does not fall back to its own heuristics.
-                    encCtx->bit_rate = 1500000;                   // ~1.5 Mbps
+                    // Rough heuristic: estimate CRF from bitrate
+                    // Higher bitrate = lower CRF (better quality)
+                    double bitsPerPixelPerSecond = (double)decCtx->bit_rate / (decCtx->width * decCtx->height * 30);  // assume 30fps
+                    if (bitsPerPixelPerSecond > 0.05) inferredCrf = 20;  // high quality
+                    else if (bitsPerPixelPerSecond > 0.02) inferredCrf = 26;
+                    else inferredCrf = 32;  // lower quality for low bitrate
                 }
+                
+                av_dict_set(&opts, "usage", "realtime", 0);   // reduces lag buffers and complexity
+                av_dict_set(&opts, "lag-in-frames", "0", 0);  // avoid allocating large lag buffers
+                av_dict_set(&opts, "crf", std::to_string(inferredCrf).c_str(), 0);  // inferred from input
+                av_dict_set(&opts, "b", "0", 0);              // pure CRF (no bitrate)
+                av_dict_set(&opts, "enable-tpl", "0", 0);     // disable TPL model (saves RAM)
+                av_dict_set(&opts, "row-mt", "1", 0);         // row multi-threading
+                av_dict_set(&opts, "cpu-used", "7", 0);       // faster / lower memory
 
-                int openErr = avcodec_open2(encCtx, enc, &opts);
-                av_dict_free(&opts);
-                if (openErr < 0)
-                    goto cleanup;
+                // Preserve the original bitrate if available
+                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
+                    encCtx->bit_rate = decCtx->bit_rate;
+                else if (encCtx->bit_rate <= 0)
+                    encCtx->bit_rate = 1500000;                   // ~1.5 Mbps default
             }
+            else if (enc->id == AV_CODEC_ID_H264)
+            {
+                // H.264 (libx264) encoder options: try to preserve input quality level
+                // CRF range is 0-51, where 23 is default; lower = better quality
+                
+                int inferredCrf = 23;  // default
+                if (decCtx->bit_rate > 0)
+                {
+                    // Infer CRF from bitrate as proxy for original quality
+                    double bitsPerPixelPerSecond = (double)decCtx->bit_rate / (decCtx->width * decCtx->height * 30);
+                    if (bitsPerPixelPerSecond > 0.08) inferredCrf = 18;  // high quality
+                    else if (bitsPerPixelPerSecond > 0.04) inferredCrf = 23;
+                    else inferredCrf = 28;  // lower quality
+                }
+                
+                av_dict_set(&opts, "preset", "fast", 0);      // balance speed and quality
+                av_dict_set(&opts, "crf", std::to_string(inferredCrf).c_str(), 0);  // inferred from input
+                
+                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
+                    encCtx->bit_rate = decCtx->bit_rate;
+                else if (encCtx->bit_rate <= 0)
+                    encCtx->bit_rate = 2500000;                   // ~2.5 Mbps default for H.264
+            }
+            else if (enc->id == AV_CODEC_ID_HEVC)
+            {
+                // H.265/HEVC (libx265) encoder options: try to preserve input quality level
+                // CRF range is 0-51, where 28 is default; lower = better quality
+                
+                int inferredCrf = 28;  // default
+                if (decCtx->bit_rate > 0)
+                {
+                    double bitsPerPixelPerSecond = (double)decCtx->bit_rate / (decCtx->width * decCtx->height * 30);
+                    if (bitsPerPixelPerSecond > 0.06) inferredCrf = 22;  // high quality
+                    else if (bitsPerPixelPerSecond > 0.03) inferredCrf = 28;
+                    else inferredCrf = 35;  // lower quality
+                }
+                
+                av_dict_set(&opts, "preset", "fast", 0);      // balance speed and quality
+                av_dict_set(&opts, "crf", std::to_string(inferredCrf).c_str(), 0);  // inferred from input
+                
+                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
+                    encCtx->bit_rate = decCtx->bit_rate;
+                else if (encCtx->bit_rate <= 0)
+                    encCtx->bit_rate = 1500000;                   // ~1.5 Mbps default for HEVC
+            }
+            else if (enc->id == AV_CODEC_ID_VP9)
+            {
+                // VP9 encoder options: VP9 uses 0-63 quality scale
+                int inferredQuality = 40;  // default (lower quality)
+                if (decCtx->bit_rate > 0)
+                {
+                    double bitsPerPixelPerSecond = (double)decCtx->bit_rate / (decCtx->width * decCtx->height * 30);
+                    if (bitsPerPixelPerSecond > 0.08) inferredQuality = 20;  // high quality
+                    else if (bitsPerPixelPerSecond > 0.04) inferredQuality = 35;
+                    else inferredQuality = 45;  // lower quality
+                }
+                
+                av_dict_set(&opts, "deadline", "good", 0);    // quality mode (realtime, good, best)
+                av_dict_set(&opts, "cpu-used", "5", 0);       // complexity (0-8, higher=faster)
+                av_dict_set(&opts, "quality", std::to_string(inferredQuality).c_str(), 0);  // inferred from input
+                
+                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
+                    encCtx->bit_rate = decCtx->bit_rate;
+                else if (encCtx->bit_rate <= 0)
+                    encCtx->bit_rate = 2000000;                   // ~2 Mbps default for VP9
+            }
+            else
+            {
+                // Generic fallback: preserve bitrate and use reasonable quality
+                if (encCtx->bit_rate <= 0 && decCtx->bit_rate > 0)
+                    encCtx->bit_rate = decCtx->bit_rate;
+                else if (encCtx->bit_rate <= 0)
+                    encCtx->bit_rate = 2500000;                   // ~2.5 Mbps default
+            }
+
+            int openErr = avcodec_open2(encCtx, enc, &opts);
+            av_dict_free(&opts);
+            if (openErr < 0)
+                goto cleanup;
 
             if (avcodec_parameters_from_context(outStream->codecpar, encCtx) < 0)
                 goto cleanup;
@@ -1049,6 +1177,33 @@ private:
                 goto cleanup;
             ofmtCtx->pb = outAvio;
             ofmtCtx->flags |= AVFMT_FLAG_CUSTOM_IO;
+        }
+
+        // Preserve metadata from input container to output container.
+        {
+            // Copy major_brand, minor_version, and compatible_brands from input to output.
+            // These are part of the ftyp box and critical for proper MP4/AV1 container format.
+            AVDictionaryEntry* entry = nullptr;
+            while ((entry = av_dict_get(ifmtCtx->metadata, "", entry, AV_DICT_IGNORE_SUFFIX)) != nullptr)
+            {
+                // Skip encoder tag as we're re-encoding
+                if (strcmp(entry->key, "encoder") != 0)
+                {
+                    av_dict_set(&ofmtCtx->metadata, entry->key, entry->value, 0);
+                }
+            }
+
+            // Also copy stream metadata (like handler_name and creation_time from video stream)
+            if (videoStreamIndex >= 0 && ifmtCtx->streams[videoStreamIndex])
+            {
+                AVStream* inStream = ifmtCtx->streams[videoStreamIndex];
+                AVStream* outStream = ofmtCtx->streams[0];
+                entry = nullptr;
+                while ((entry = av_dict_get(inStream->metadata, "", entry, AV_DICT_IGNORE_SUFFIX)) != nullptr)
+                {
+                    av_dict_set(&outStream->metadata, entry->key, entry->value, 0);
+                }
+            }
         }
 
         if (avformat_write_header(ofmtCtx, nullptr) < 0)
@@ -1477,8 +1632,6 @@ private:
                             if (!itInit2Ptr)
                                 break;
 
-                            saveOneSegmentToFile(replaySaveKey, itInit2Ptr, frag, replayIsAudio, headerId);
-
                             std::vector<uint8_t> mp4;
                             mp4.reserve(itInit2Ptr->size() + frag.size());
                             mp4.insert(mp4.end(), itInit2Ptr->begin(), itInit2Ptr->end());
@@ -1554,11 +1707,7 @@ private:
             const bool isAudio = (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag
                 && isAudioOnlyItag(itMeta->second.itag));
 
-            // Save each segment as a separate file (init + segment per file; init reused from state when missing).
-            {
-                std::string saveKey = urlForSaveKey.empty() ? streamKey : ("url_" + std::to_string(std::hash<std::string>{}(urlForSaveKey)));
-                saveOneSegmentToFile(saveKey, init, segment, isAudio, headerId);
-            }
+            
 
             // In save-only mode we do not modify the stream; we already saved above. Skip FFmpeg and emit.
             if (g_saveOnlyNoModify)
@@ -1583,7 +1732,17 @@ private:
                     processedMp4 = std::move(mp4);
                 }
             }
-
+            // Save each segment as a separate file (init + original segment per file; init reused from state when missing).
+            {
+                std::string saveKey = urlForSaveKey.empty() ? streamKey : ("url_" + std::to_string(std::hash<std::string>{}(urlForSaveKey)));
+                saveOneSegmentToFile(saveKey, init, mp4, isAudio, headerId, true);
+            }
+            //
+            // Save each segment as a separate file (init + modified segment per file; init reused from state when missing).
+            {
+                std::string saveKey = urlForSaveKey.empty() ? streamKey : ("url_" + std::to_string(std::hash<std::string>{}(urlForSaveKey)));
+                saveOneSegmentToFile(saveKey, init, processedMp4, isAudio, headerId, false);
+            }
             // Repackage the (possibly processed) MP4 back into UMP MEDIA + MEDIA_END
             // (googlevideo UMPPartId; shape matches googlevideo-c/tests/ump_example_test.cpp).
             // Emit one MEDIA part (headerId + fragment bytes) then MEDIA_END (headerId only).
