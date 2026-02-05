@@ -1182,13 +1182,13 @@ private:
 
             if (avcodec_parameters_from_context(outStream->codecpar, encCtx) < 0)
                 goto cleanup;
-            outStream->time_base = encCtx->time_base;
             
-            // Preserve duration and frame rate from input stream to output stream
-            // This ensures the output file has the correct duration and fps metadata
+            // Use the input stream's time_base for output to keep PTS/DTS values consistent
             if (videoStreamIndex >= 0 && ifmtCtx->streams[videoStreamIndex])
             {
                 AVStream* inStream = ifmtCtx->streams[videoStreamIndex];
+                outStream->time_base = inStream->time_base;
+                
                 // Copy frame rate information
                 if (inStream->avg_frame_rate.num > 0 && inStream->avg_frame_rate.den > 0)
                 {
@@ -1201,9 +1201,13 @@ private:
                 // Copy duration information from input to output
                 if (inStream->duration > 0)
                 {
-                    // Convert duration from input time_base to output time_base
-                    outStream->duration = av_rescale_q(inStream->duration, inStream->time_base, outStream->time_base);
+                    outStream->duration = inStream->duration;
                 }
+            }
+            else
+            {
+                // Fallback if no input stream
+                outStream->time_base = encCtx->time_base;
             }
             
             // Also preserve container-level duration if available
@@ -1350,6 +1354,7 @@ private:
                 sws_freeContext(swsBack);
 
                 encFrame->pts = frame->pts;
+                encFrame->duration = frame->duration;
 
                 if (avcodec_send_frame(encCtx, encFrame) < 0)
                 {
@@ -1367,11 +1372,7 @@ private:
                         goto cleanup;
 
                     encPkt->stream_index = 0;
-                    av_packet_rescale_ts(encPkt, decCtx->time_base, ofmtCtx->streams[0]->time_base);
-                    // Set packet duration in output time base
-                    if (encPkt->duration > 0) {
-                        encPkt->duration = av_rescale_q(encPkt->duration, decCtx->time_base, ofmtCtx->streams[0]->time_base);
-                    }
+                    // No need to rescale - output stream uses same time_base as input
                     if (av_interleaved_write_frame(ofmtCtx, encPkt) < 0)
                     {
                         av_packet_unref(encPkt);
@@ -1392,11 +1393,7 @@ private:
             if (er < 0)
                 goto cleanup;
             encPkt->stream_index = 0;
-            av_packet_rescale_ts(encPkt, decCtx->time_base, ofmtCtx->streams[0]->time_base);
-            // Set packet duration in output time base
-            if (encPkt->duration > 0) {
-                encPkt->duration = av_rescale_q(encPkt->duration, decCtx->time_base, ofmtCtx->streams[0]->time_base);
-            }
+            // No need to rescale - output stream uses same time_base as input
             if (av_interleaved_write_frame(ofmtCtx, encPkt) < 0)
             {
                 av_packet_unref(encPkt);
@@ -1793,12 +1790,11 @@ private:
                     processedMp4 = std::move(mp4);
                 }
             }
-            // Save each segment as a separate file (init + original segment per file; init reused from state when missing).
+            //
             {
                 std::string saveKey = urlForSaveKey.empty() ? streamKey : ("url_" + std::to_string(std::hash<std::string>{}(urlForSaveKey)));
                 saveOneSegmentToFile(saveKey, init, mp4, isAudio, headerId, true);
             }
-            //
             // Save each segment as a separate file (init + modified segment per file; init reused from state when missing).
             {
                 std::string saveKey = urlForSaveKey.empty() ? streamKey : ("url_" + std::to_string(std::hash<std::string>{}(urlForSaveKey)));
