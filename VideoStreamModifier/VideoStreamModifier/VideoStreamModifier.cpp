@@ -1574,6 +1574,67 @@ private:
                 // If we previously queued fragments waiting for init, replay them now (only when modifying).
                 if (!g_saveOnlyNoModify)
                 {
+                    // Send init segment via UMP: MEDIA_HEADER (is_init_seg=true) + MEDIA + MEDIA_END
+                    {
+                        // Emit MEDIA_HEADER with is_init_seg=true
+                        {
+                            std::vector<uint8_t> headerData;
+                            // Encode header_id (field 1, wire type 0 = varint)
+                            headerData.push_back((1 << 3) | 0);
+                            headerData.push_back(headerId);
+                            // Encode itag (field 3, wire type 0 = varint) if available
+                            if (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag)
+                            {
+                                headerData.push_back((3 << 3) | 0);
+                                uint32_t itag = itMeta->second.itag;
+                                if (itag < 128) {
+                                    headerData.push_back(itag);
+                                } else {
+                                    headerData.push_back((itag & 0x7F) | 0x80);
+                                    headerData.push_back(itag >> 7);
+                                }
+                            }
+                            // Encode is_init_seg (field 8, wire type 0 = varint) = 1 for init
+                            headerData.push_back((8 << 3) | 0);
+                            headerData.push_back(1);
+                            
+                            umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerData);
+                            printf("[UMP-OUT] #%zu part MEDIA_HEADER: headerId=%u itag=%d is_init_seg=true (%zu bytes)\n",
+                                ++partWriteCount, (unsigned)headerId, itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag ? itMeta->second.itag : -1, headerData.size());
+                        }
+
+                        // Get the init segment we just stored
+                        const std::vector<uint8_t>* initPtr = nullptr;
+                        if (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag)
+                        {
+                            auto itInitItag = assem.initByItag.find(itMeta->second.itag);
+                            if (itInitItag != assem.initByItag.end() && !itInitItag->second.empty())
+                                initPtr = &itInitItag->second;
+                        }
+                        if (!initPtr)
+                        {
+                            auto itInitHdr = assem.initByHeaderId.find(headerId);
+                            if (itInitHdr != assem.initByHeaderId.end() && !itInitHdr->second.empty())
+                                initPtr = &itInitHdr->second;
+                        }
+
+                        // Emit MEDIA with init segment
+                        if (initPtr && !initPtr->empty())
+                        {
+                            std::vector<uint8_t> mediaInitData;
+                            mediaInitData.push_back(headerId);
+                            mediaInitData.insert(mediaInitData.end(), initPtr->begin(), initPtr->end());
+                            umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaInitData);
+                            printf("[UMP-OUT] #%zu part MEDIA: headerId=%u (init segment) (%zu bytes)\n",
+                                ++partWriteCount, (unsigned)headerId, initPtr->size());
+                        }
+
+                        // Emit MEDIA_END
+                        std::vector<uint8_t> mediaEndData(1);
+                        mediaEndData[0] = headerId;
+                        umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaEndData);
+                        printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
+                    }
                     auto itPending = assem.pendingByHeaderId.find(headerId);
                     if (itPending != assem.pendingByHeaderId.end() && !itPending->second.empty())
                     {
@@ -1737,7 +1798,7 @@ private:
             // We split them: first time send init-only, subsequent times send fragment-only.
             
             bool shouldSendInit = (assem.initSentForHeaderId.find(headerId) == assem.initSentForHeaderId.end());
-            
+            shouldSendInit = false;
             if (shouldSendInit)
             {
                 // First segment: need to send MEDIA_HEADER first, then split and send init/fragment separately
@@ -1881,37 +1942,39 @@ private:
                     }
                 }
                 
-                // Send MEDIA_HEADER for subsequent segments (is_init_seg=false)
-                // This tells the browser which codec stream this fragment belongs to
-                {
-                    std::vector<uint8_t> headerData;
-                    // Varint encode the header ID
-                    headerData.push_back(headerId);
-                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerData);
-                    auto itMeta = assem.metaByHeaderId.find(headerId);
-                    printf("[UMP-OUT] #%zu part MEDIA_HEADER: headerId=%u itag=%d is_init_seg=false (%zu bytes)\n",
-                        ++partWriteCount, (unsigned)headerId, itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag ? itMeta->second.itag : -1, headerData.size());
-                }
-                
-                // For audio: if no fragment boxes but init boxes exist, send the init boxes as media
-                // (audio init segments don't have separate fragment boxes)
-                if (fragmentBoxes.empty() && !initBoxes.empty() && isAudio)
-                {
-                    std::vector<uint8_t> mediaInitData;
-                    mediaInitData.push_back(headerId);
-                    mediaInitData.insert(mediaInitData.end(), initBoxes.begin(), initBoxes.end());
-                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaInitData);
-                    printf("[UMP-OUT] #%zu part MEDIA: headerId=%u (audio: ftyp/moov as data) (%zu bytes)\n",
-                        ++partWriteCount, (unsigned)headerId, initBoxes.size());
-                    
-                    std::vector<uint8_t> mediaInitEndData(1);
-                    mediaInitEndData[0] = headerId;
-                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaInitEndData);
-                    printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
-                }
                 // For video or audio with fragments: send fragment boxes as normal
-                else if (!fragmentBoxes.empty())
+                if (!fragmentBoxes.empty())
                 {
+                    // Send MEDIA_HEADER for subsequent segments (is_init_seg=false)
+                    // This tells the browser which codec stream this fragment belongs to
+                    {
+                        std::vector<uint8_t> headerData;
+                        // Encode header_id (field 1, wire type 0 = varint)
+                        headerData.push_back((1 << 3) | 0);
+                        headerData.push_back(headerId);
+
+                        // Encode itag (field 3, wire type 0 = varint) if available
+                        if (itMeta != assem.metaByHeaderId.end() && itMeta->second.hasItag)
+                        {
+                            headerData.push_back((3 << 3) | 0);
+                            uint32_t itag = itMeta->second.itag;
+                            if (itag < 128) {
+                                headerData.push_back(itag);
+                            } else {
+                                headerData.push_back((itag & 0x7F) | 0x80);
+                                headerData.push_back(itag >> 7);
+                            }
+                        }
+
+                        // Encode is_init_seg (field 8, wire type 0 = varint) = 0 for non-init
+                        headerData.push_back((8 << 3) | 0);
+                        headerData.push_back(0);
+
+                        umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_HEADER, headerData);
+                        auto itMetaLog = assem.metaByHeaderId.find(headerId);
+                        printf("[UMP-OUT] #%zu part MEDIA_HEADER: headerId=%u itag=%d is_init_seg=false (%zu bytes)\n",
+                            ++partWriteCount, (unsigned)headerId, itMetaLog != assem.metaByHeaderId.end() && itMetaLog->second.hasItag ? itMetaLog->second.itag : -1, headerData.size());
+                    }
                     std::vector<uint8_t> mediaFragData;
                     mediaFragData.push_back(headerId);
                     mediaFragData.insert(mediaFragData.end(), fragmentBoxes.begin(), fragmentBoxes.end());
@@ -1922,21 +1985,6 @@ private:
                     std::vector<uint8_t> mediaFragEndData(1);
                     mediaFragEndData[0] = headerId;
                     umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaFragEndData);
-                    printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
-                }
-                // Fallback: no recognized boxes, send everything as-is
-                else if (!processedMp4.empty())
-                {
-                    std::vector<uint8_t> mediaData;
-                    mediaData.push_back(headerId);
-                    mediaData.insert(mediaData.end(), processedMp4.begin(), processedMp4.end());
-                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA, mediaData);
-                    printf("[UMP-OUT] #%zu part MEDIA: headerId=%u (fallback: all bytes) (%zu bytes)\n",
-                        ++partWriteCount, (unsigned)headerId, processedMp4.size());
-                    
-                    std::vector<uint8_t> mediaEndData(1);
-                    mediaEndData[0] = headerId;
-                    umpWritePart(assem.rewrittenUmpOut, UMP_PART_ID_MEDIA_END, mediaEndData);
                     printf("[UMP-OUT] #%zu part MEDIA_END: headerId=%u\n", ++partWriteCount, (unsigned)headerId);
                 }
             }
